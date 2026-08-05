@@ -6,7 +6,7 @@
 
 일반 사용자는 GitHub Release에서 Windows 실행 ZIP을 받습니다.
 
-1. `internal-upload_v0.5.0_windows.zip`을 다운로드합니다.
+1. `internal-upload_v0.5.1_windows.zip`을 다운로드합니다.
 2. Windows 서버 PC의 원하는 폴더에 ZIP을 완전히 압축 해제합니다.
 3. `start_internal_upload.cmd`를 더블클릭합니다.
 4. 콘솔에 표시된 실제 접속 주소를 브라우저에서 엽니다. 기본 주소는 아래와 같습니다.
@@ -146,7 +146,7 @@ TCP 전송 성능 측정은 서버 전용 `InternalUploadServer.exe`와 측정 �
 
 웹 다운로드는 TCP 측정 서버가 정상이며 Windows Release 서버로 실행할 때만 사용할 수 있습니다. 소스 실행 환경에는 Windows 클라이언트 바이너리가 없으므로 클라이언트 ZIP 다운로드를 제공하지 않습니다.
 
-서버와 클라이언트 릴리즈 버전은 웹 화면에 함께 표시됩니다. `v0.5.0`은 TCP 프로토콜 `v2`를 유지하므로 `v0.4.3` 이후 클라이언트와 프로토콜상 호환되지만, 실행 역할이 분리된 최신 클라이언트 ZIP 사용을 권장합니다. `v0.4.2` 및 이전 클라이언트는 서버 웹 화면에서 최신 ZIP을 다시 받아야 합니다.
+서버와 클라이언트 릴리즈 버전은 웹 화면에 함께 표시됩니다. `v0.5.1`은 TCP 프로토콜 `v2`를 유지하므로 `v0.4.3` 이후 클라이언트와 프로토콜상 호환되지만, 실행 역할이 분리된 최신 클라이언트 ZIP 사용을 권장합니다. `v0.4.2` 및 이전 클라이언트는 서버 웹 화면에서 최신 ZIP을 다시 받아야 합니다.
 
 지원 범위:
 
@@ -215,7 +215,7 @@ HTTP 데이터량 기준 업로드 세션은 마지막 청크 이후 15분 동�
 
 HTTP 시간 기준과 TCP 결과 JSON은 권한·형식 검증과 원문 읽기를 한 번에 수행합니다. 오래된 결과 정리와 다운로드가 겹치거나 파일이 잘못된 UTF-8이면 절대 경로나 traceback을 노출하는 HTML 500 대신 `RESULT_READ_FAILED` JSON 오류를 반환합니다. 처음부터 없는 결과의 404와 HTTP 시간 기준 결과의 요청 IP 제한 403은 유지합니다.
 
-현재 구조, 사용자별 평가, 안정성 근거, P0/P1/P2 목록과 단계별 검증 계획은 [v0.5.0 한국어 프로젝트 진단 보고서](https://github.com/sebia1993/-/blob/v0.5.0/docs/PROJECT_DIAGNOSTIC_AND_IMPROVEMENT_PLAN_KO.md)에 정리했습니다. 소스 저장소에서는 `docs/PROJECT_DIAGNOSTIC_AND_IMPROVEMENT_PLAN_KO.md` 경로로도 확인할 수 있습니다.
+현재 구조, 사용자별 평가, 안정성 근거, P0/P1/P2 목록과 단계별 검증 계획은 [v0.5.1 한국어 프로젝트 진단 보고서](https://github.com/sebia1993/-/blob/v0.5.1/docs/PROJECT_DIAGNOSTIC_AND_IMPROVEMENT_PLAN_KO.md)에 정리했습니다. 소스 저장소에서는 `docs/PROJECT_DIAGNOSTIC_AND_IMPROVEMENT_PLAN_KO.md` 경로로도 확인할 수 있습니다.
 
 ## GitHub 이력관리와 릴리즈 문서
 
@@ -226,7 +226,7 @@ GitHub에 push하거나 Release를 준비하기 전에는 아래 파일을 함�
 - `CHANGELOG.md`: 사용자 관점 변경사항
 - `AGENTS.md`: Codex 작업 규칙과 문서 최신화 기준
 
-현재 정식 Release는 `v0.5.0`이며 실행용 asset은 `internal-upload_v0.5.0_windows.zip`과 SHA256 파일입니다. GitHub가 자동으로 표시하는 `Source code (zip)` / `Source code (tar.gz)`는 소스 아카이브이며 일반 실행용 ZIP이 아닙니다.
+현재 정식 Release는 `v0.5.1`이며 실행용 asset은 `internal-upload_v0.5.1_windows.zip`과 SHA256 파일입니다. GitHub가 자동으로 표시하는 `Source code (zip)` / `Source code (tar.gz)`는 소스 아카이브이며 일반 실행용 ZIP이 아닙니다.
 
 Windows ZIP은 PyInstaller `onedir` 포터블 구조이므로 EXE 옆의 `_internal` 폴더를 이동하거나 삭제하면 실행되지 않습니다. 서버는 시작 과정에서 PowerShell을 호출하지 않으며 레지스트리, 시작프로그램, 예약 작업과 Windows 방화벽을 변경하지 않습니다. 코드서명 미적용, 사내망 전체 무인증 접근, HTTP/TCP 평문 토큰 전송, 요청 Host를 이용한 클라이언트 ZIP 접속 주소 생성, 파일 크기 무제한, 압축파일 내부 미검사와 TCP 클라이언트 장기 폴링은 남아 있는 운영 위험입니다. 신뢰 VLAN과 ACL 밖에 직접 노출하지 마세요.
 

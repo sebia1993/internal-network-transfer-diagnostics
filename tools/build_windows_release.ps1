@@ -236,6 +236,7 @@ TCP 전송 성능 측정:
 - Windows 반복 시험에 working set·handle·thread·TCP socket 계측과 독립 누수 분석기 추가
 - 현재 소스 근거, 사용자별 평가와 P0/P1/P2 계획을 담은 한국어 진단 보고서 추가
 - Windows PowerShell 5.1 한국어와 CMD 실행을 각각 UTF-8 BOM/no-BOM으로 고정하고 local/Actions native 실패를 즉시 전파
+- Actions checkout 뒤 원격 tag ref를 다시 받아 annotated tag object와 source commit 일치를 검증
 - 기존 업로드·다운로드 URL, CSV·JSON·Excel 형식과 TCP 프로토콜 ``v2`` 유지
 
 ## 검증

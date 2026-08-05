@@ -6,7 +6,7 @@ on:
       version:
         description: "Release version tag, for example v0.3.0"
         required: true
-        default: "v0.5.0"
+        default: "v0.5.1"
   push:
     tags:
       - "v*"
@@ -32,6 +32,10 @@ jobs:
         run: |
           if ($env:RELEASE_VERSION -notmatch '^v\d+\.\d+\.\d+(?:-rc\.\d+)?$') {
             throw "Invalid release version: $env:RELEASE_VERSION"
+          }
+          git fetch --force --no-tags origin "refs/tags/${env:RELEASE_VERSION}:refs/tags/${env:RELEASE_VERSION}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to fetch release tag $env:RELEASE_VERSION from origin"
           }
           git show-ref --verify --quiet "refs/tags/$env:RELEASE_VERSION"
           if ($LASTEXITCODE -ne 0) {
