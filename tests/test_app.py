@@ -1270,8 +1270,16 @@ def test_windows_release_workflow_checks_all_release_runtime_modules_and_scripts
     ):
         assert f'Assert-NativeSuccess "{operation}" $LASTEXITCODE' in workflow
     assert f'default: "{APP_VERSION}"' in workflow
+    assert (
+        'git fetch --force --no-tags origin '
+        '"refs/tags/${env:RELEASE_VERSION}:refs/tags/${env:RELEASE_VERSION}"'
+    ) in workflow
+    assert "Unable to fetch release tag" in workflow
     assert 'git show-ref --verify --quiet "refs/tags/$env:RELEASE_VERSION"' in workflow
     assert 'git cat-file -t "refs/tags/$env:RELEASE_VERSION"' in workflow
+    assert workflow.index("git fetch --force --no-tags origin") < workflow.index(
+        'git cat-file -t "refs/tags/$env:RELEASE_VERSION"'
+    )
     assert "must be an annotated tag" in workflow
     assert "--verify-tag" in workflow
     assert "--target $env:GITHUB_SHA" not in workflow

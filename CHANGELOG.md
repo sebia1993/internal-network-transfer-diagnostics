@@ -6,6 +6,12 @@
 
 - 현재 예정된 변경사항이 없습니다.
 
+## v0.5.1 - 2026-08-05
+
+- `v0.5.0` annotated tag push는 Actions checkout이 로컬 tag ref를 commit으로 평탄화해 immutable-tag 검사에서 빌드 전에 중단됐으며 GitHub Release와 asset은 생성되지 않았습니다.
+- 릴리스 workflow가 원격의 정확한 tag ref를 force-fetch한 뒤 object type과 checkout commit을 검사하도록 수정했습니다.
+- `v0.5.0`에 준비한 모든 사용성·안정성 개선, URL·저장 형식·TCP 프로토콜 `v2` 호환성과 검증 계약을 그대로 포함합니다.
+
 ## v0.5.0 - 2026-08-05
 
 안정성과 기존 업무 흐름을 유지하는 개선:
