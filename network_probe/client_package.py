@@ -296,8 +296,11 @@ def verify_client_package(payload: bytes, server_url: str) -> list[str]:
                             errors.append(f"클라이언트 파일 해시가 일치하지 않습니다: {relative}")
             if readme_name in names and server_url not in archive.read(readme_name).decode("utf-8-sig"):
                 errors.append("클라이언트 안내문에 서버 주소가 없습니다.")
-    except (OSError, TypeError, ValueError, KeyError, AttributeError) as exc:
-        errors.append(f"클라이언트 ZIP을 확인할 수 없습니다: {exc}")
+    except (OSError, TypeError, ValueError, KeyError, AttributeError):
+        errors.append(
+            "클라이언트 ZIP을 확인할 수 없습니다. 오류 코드: "
+            "CLIENT_PACKAGE_VERIFY_FAILED."
+        )
     return errors
 
 
@@ -355,8 +358,12 @@ def build_client_package(bundle_path: Path, server_url: str) -> ClientPackage:
                 f"{root_name}/{CLIENT_README_NAME}",
                 readme_payload,
             )
-    except OSError as exc:
-        raise ClientPackageError(f"Windows 클라이언트 ZIP 생성에 실패했습니다: {exc}") from exc
+    except OSError:
+        raise ClientPackageError(
+            "Windows 클라이언트 ZIP 생성에 실패했습니다. 오류 코드: "
+            "CLIENT_PACKAGE_BUILD_FAILED. 서버 저장 공간과 파일 접근 권한을 "
+            "확인하세요."
+        ) from None
 
     payload = output.getvalue()
     errors = verify_client_package(payload, server_url)

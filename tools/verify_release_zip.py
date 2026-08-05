@@ -135,8 +135,16 @@ def validate_csv_header(zip_file: ZipFile, name: str, expected_prefix: list[str]
 
 
 def validate_server_launcher(zip_file: ZipFile) -> list[str]:
-    command = zip_file.read("start_internal_upload.cmd").decode("utf-8-sig")
     errors = []
+    raw_command = zip_file.read("start_internal_upload.cmd")
+    if raw_command.startswith(b"\xef\xbb\xbf"):
+        errors.append("start_internal_upload.cmd must not start with a UTF-8 BOM")
+    try:
+        command = raw_command.decode("utf-8")
+    except UnicodeDecodeError:
+        return errors + ["start_internal_upload.cmd must be valid UTF-8"]
+    if not command.startswith("@echo off"):
+        errors.append("start_internal_upload.cmd must start with @echo off")
     if SERVER_EXECUTABLE not in command:
         errors.append(f"start_internal_upload.cmd does not start {SERVER_EXECUTABLE}")
     if "실제 접속 주소" not in command or "config.ini" not in command:

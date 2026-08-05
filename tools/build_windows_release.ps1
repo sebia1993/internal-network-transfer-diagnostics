@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^v\d+\.\d+\.\d+(?:-rc\.\d+)?$')]
     [string]$Version
@@ -6,6 +6,18 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+function Assert-NativeSuccess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Operation,
+        [Parameter(Mandatory = $true)]
+        [int]$ExitCode
+    )
+    if ($ExitCode -ne 0) {
+        throw "$Operation failed with exit code $ExitCode"
+    }
+}
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $DistRoot = Join-Path $Root "dist"
@@ -30,7 +42,9 @@ New-Item -ItemType Directory -Force -Path $DistRoot, $BuildRoot, $PackageRoot, $
 
 Push-Location $Root
 try {
-    $SourceVersion = (python -c "from app_version import APP_VERSION; print(APP_VERSION)").Trim()
+    $SourceVersionOutput = python -c "from app_version import APP_VERSION; print(APP_VERSION)"
+    Assert-NativeSuccess "Source version lookup" $LASTEXITCODE
+    $SourceVersion = $SourceVersionOutput.Trim()
     if ($SourceVersion -ne $Version) {
         throw "Source APP_VERSION $SourceVersion does not match requested release $Version"
     }
@@ -39,7 +53,10 @@ try {
     if ($WorktreeStatus) {
         throw "Release builds require a clean Git worktree so security_manifest.json matches the source commit"
     }
-    $SourceCommit = if ($env:GITHUB_SHA) { $env:GITHUB_SHA } else { (git rev-parse HEAD).Trim() }
+    $SourceCommit = (git rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $SourceCommit) {
+        throw "Unable to resolve the source commit for the release"
+    }
 
     python tools/generate_windows_version_info.py `
         --version $Version `
@@ -47,12 +64,14 @@ try {
         --description "Internal file upload and network measurement server" `
         --filename "InternalUploadServer.exe" `
         --output $ServerVersionInfo
+    Assert-NativeSuccess "Server version metadata generation" $LASTEXITCODE
     python tools/generate_windows_version_info.py `
         --version $Version `
         --product-name "Network Probe Client" `
         --description "Internal TCP network measurement client" `
         --filename "NetworkProbeClient.exe" `
         --output $ClientVersionInfo
+    Assert-NativeSuccess "Client version metadata generation" $LASTEXITCODE
 
     python -m PyInstaller `
         --noconfirm `
@@ -67,6 +86,7 @@ try {
         --add-data "${TemplatesPath};templates" `
         --add-data "${StaticPath};static" `
         app.py
+    Assert-NativeSuccess "Server executable build" $LASTEXITCODE
 
     python -m PyInstaller `
         --noconfirm `
@@ -79,6 +99,7 @@ try {
         --workpath $ClientWork `
         --specpath $BuildRoot `
         probe_client.py
+    Assert-NativeSuccess "Client executable build" $LASTEXITCODE
 
     $ServerBundle = Join-Path $PyInstallerDist "InternalUploadServer"
     $ClientBundle = Join-Path $PyInstallerDist "NetworkProbeClient"
@@ -110,7 +131,8 @@ try {
     Copy-Item "data/network_probe_results/README_RESULTS_KO.txt" (Join-Path $PackageRoot "data/network_probe_results/README_RESULTS_KO.txt")
     "업로드 파일이 저장되는 폴더입니다. 운영 중 생성된 파일은 GitHub에 올리지 마세요." | Set-Content -Path (Join-Path $PackageRoot "uploads/README_UPLOADS_KO.txt") -Encoding UTF8
 
-    @"
+    $LauncherPath = Join-Path $PackageRoot "start_internal_upload.cmd"
+    $LauncherContent = @"
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
@@ -124,7 +146,9 @@ echo 종료하려면 이 창에서 Ctrl+C를 누르세요.
 echo.
 InternalUploadServer.exe
 pause
-"@ | Set-Content -Path (Join-Path $PackageRoot "start_internal_upload.cmd") -Encoding UTF8
+"@
+    $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($LauncherPath, $LauncherContent, $Utf8NoBom)
 
     @"
 사내 업로드 $Version Windows 포터블 폴더 ZIP
@@ -138,6 +162,8 @@ pause
 
 운영 안정성:
 - 같은 data 폴더를 사용하는 서버는 하나만 실행됩니다.
+- 중단된 업로드·삭제와 HTTP/TCP 결과 저장은 다음 시작 때 트랜잭션 기록으로 복구합니다.
+- 복구할 수 없는 충돌은 정상으로 추정하지 않고 안정된 오류 코드로 시작을 중단합니다.
 - 시작 시 CSV 끝이 불완전하면 원본 .bak 파일을 남긴 뒤 마지막 레코드만 복구합니다.
 - 진단 로그는 data/diagnostics에 2MB 단위로 순환 저장됩니다.
 - 파일 업로드는 최대 4건을 처리하고 남은 예상 용량을 합산해 디스크 공간을 예약합니다.
@@ -146,6 +172,7 @@ pause
 - Ctrl+C 종료 시 새 요청을 차단하고 진행 중인 요청을 최대 30초 기다립니다.
 - Windows의 파일·CSV·JSON·설정 교체는 디스크 반영을 기다리는 write-through 방식입니다.
 - 측정 CSV는 오래된 행을 월별로 보관하고 상세 JSON은 유형별 최신 1,000건을 유지합니다.
+- 웹 첫 화면의 운영 요약은 최근 완료·취소·실패, 부분 장애와 권장 조치를 민감정보 없이 표시합니다.
 
 TCP 전송 성능 측정:
 1. TCP 측정 서버는 기본으로 함께 시작됩니다. 기본 포트는 5201입니다.
@@ -181,9 +208,11 @@ TCP 전송 성능 측정:
         --version $Version `
         --source-commit $SourceCommit `
         --requirements-lock (Join-Path $Root "requirements-windows.lock")
+    Assert-NativeSuccess "Security artifact generation" $LASTEXITCODE
 
     Compress-Archive -Path (Join-Path $PackageRoot "*") -DestinationPath $ZipPath -Force
     python tools/verify_release_zip.py --zip $ZipPath --version $Version
+    Assert-NativeSuccess "Release ZIP verification" $LASTEXITCODE
 
     $Hash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     [System.IO.File]::WriteAllText($ShaPath, "$Hash  $PackageName.zip`n", [System.Text.Encoding]::ASCII)
@@ -192,31 +221,29 @@ TCP 전송 성능 측정:
     }
 
     @"
-# $Version - 사내 업로드 Windows 안정성 개선 릴리즈
+# $Version - 사내 업로드 사용성 및 안정성 개선
 
 ## 주요 변경
 
-- 파일 업로드 최대 4건과 진행 중인 모든 요청의 남은 예상 용량 합산 예약
-- 동시 업로드 한도 HTTP 503, 합산 용량 부족 HTTP 507와 상태 API 점유 정보
-- Ctrl+C 종료 시 신규 요청 차단과 진행 중 요청 최대 30초 대기
-- Windows 파일·CSV·JSON·설정 교체에 MoveFileExW write-through 적용
-- 매주 45분, 수동 30·45·60분 Windows 업로드·TCP·재시작 반복 시험
-- 시작 시 운영 CSV 네 종류의 헤더와 마지막 레코드 검증
-- 마지막 미완성 CSV 레코드의 원본 백업 후 자동 제거
-- CSV 저장 경로가 현재 STORAGE_ROOT 내부인지 다운로드·삭제 전에 재검증
-- HTTP·TCP 측정 잠금의 절대 유지시간 상한과 장기 점유 상태 확인
-- 같은 data 폴더를 사용하는 서버의 중복 실행 차단
-- 2MB 순환 진단 로그와 저장소·CSV·TCP·측정 상태를 구분하는 상태 API
-- 1GB 디스크 여유 공간 보호와 업로드 중 공간 부족 임시 파일 정리
-- 웹 요청 최대 32개와 30초 무동작 연결 제한
-- 측정 CSV 월별 보관, 상세 JSON 최신 1,000건과 CSV 복구 백업 최신 5개 유지
-- PyInstaller one-file 대신 임시 자체 압축 해제가 없는 포터블 onedir 구조
-- 서버 전용 ``InternalUploadServer.exe``와 TCP 전용 ``NetworkProbeClient.exe`` 분리
-- 서버 시작 시 PowerShell과 ``ExecutionPolicy Bypass`` 실행 제거
-- 웹 클라이언트 ZIP에 서버 EXE와 CMD를 넣지 않고 고정 클라이언트 해시와 JSON 자동 연결 설정 제공
-- 실행파일, 스크립트, 매크로 문서와 디스크 이미지 업로드 차단
-- PE 버전 정보, 파일별 SHA256, CycloneDX SBOM과 보안 검토 문서 포함
-- 고정된 Windows Python 의존성 해시로 빌드
+- 업로드·삭제의 파일/CSV 경계와 HTTP/TCP 측정의 JSON/CSV 경계에 durable transaction과 재시작 복구 적용
+- 손상·충돌 transaction과 미정리 marker는 정상으로 추정하지 않고 새 작업 전에 fail-closed
+- 0바이트, 불일치 합계, 빈 결과와 변경된 응답 형식을 성공으로 저장하지 않도록 결과 검증 강화
+- 네트워크·요청 시간 상한, 동시 실행 제한, 중복 실행 방지와 취소·종료 자원 정리 강화
+- 결과 JSON 삭제 경합·손상·인코딩 오류를 경로와 traceback 없는 ``RESULT_READ_FAILED``로 반환
+- 설정·권한·저장 실패를 안정된 한국어 오류 코드와 다음 조치로 안내
+- 최근 완료·취소·실패, 부분 장애와 권장 조치를 민감정보 없이 보여주는 관리자 운영 요약 추가
+- 회전 진단 로그, 상태 API 실패 counter, 기본 config와 header-only 운영 CSV 릴리스 검사 추가
+- Windows 반복 시험에 working set·handle·thread·TCP socket 계측과 독립 누수 분석기 추가
+- 현재 소스 근거, 사용자별 평가와 P0/P1/P2 계획을 담은 한국어 진단 보고서 추가
+- Windows PowerShell 5.1 한국어와 CMD 실행을 각각 UTF-8 BOM/no-BOM으로 고정하고 local/Actions native 실패를 즉시 전파
+- 기존 업로드·다운로드 URL, CSV·JSON·Excel 형식과 TCP 프로토콜 ``v2`` 유지
+
+## 검증
+
+- 전체 회귀 458건과 장애 주입 32건 통과
+- Python compileall, JavaScript 5개 구문 검사와 의존성 무결성 검사 통과
+- Windows 2,708.89초 반복 시험 386 cycles 분석 결과 ``PASS_NO_REPEATED_PROCESS_GROWTH``
+- 서버 smoke·TCP 자체 점검, 클라이언트 자체 점검, 보안 산출물과 ZIP verifier 통과
 
 ## 실행
 
@@ -227,7 +254,7 @@ TCP 전송 성능 측정:
 ## 보안상 제한
 
 - 코드서명은 적용하지 않았으므로 보안 제품 경고가 완전히 사라지는 것을 보장하지 않습니다.
-- 사내망 전체 무인증 접근, 파일 크기 무제한, 압축파일 내부 미검사와 TCP 장기 폴링은 유지됩니다.
+- HTTP/TCP 토큰과 데이터는 평문이며 요청 Host 기반 주소 생성, 사내망 무인증 접근, 파일 크기 무제한, 압축파일 내부 미검사와 TCP 장기 폴링은 유지됩니다.
 - Windows 방화벽은 자동 조회하거나 변경하지 않습니다.
 
 SHA256: ``$Hash``

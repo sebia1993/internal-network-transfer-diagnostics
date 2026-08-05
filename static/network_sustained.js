@@ -42,6 +42,12 @@
     return `${(value / 1024 / 1024).toFixed(1)} MB`;
   }
 
+  function setOperationState(element, state) {
+    element.classList.remove("is-idle", "is-running", "is-success", "is-warning", "is-error");
+    element.classList.add(`is-${state}`);
+    element.dataset.state = state;
+  }
+
   function wait(milliseconds, signal) {
     return new Promise((resolve, reject) => {
       if (signal && signal.aborted) {
@@ -82,6 +88,7 @@
   }
 
   function createSustainedProgress(progressBar, phaseText) {
+    const progressTrack = progressBar.closest('[role="progressbar"]');
     let animationFrameId = 0;
     let currentPercent = 0;
     let completedMeasurementSeconds = 0;
@@ -102,6 +109,11 @@
       const boundedPercent = Math.min(upperBound, Math.max(0, Number(nextPercent) || 0));
       currentPercent = Math.max(currentPercent, boundedPercent);
       progressBar.style.transform = `scaleX(${(currentPercent / 100).toFixed(4)})`;
+      progressTrack.setAttribute("aria-valuenow", currentPercent.toFixed(1));
+      progressTrack.setAttribute(
+        "aria-valuetext",
+        `${label} · ${currentPercent.toFixed(1)}%${detail ? ` · ${detail}` : ""}`
+      );
 
       const now = performance.now();
       if (settings.forceLabel || now - lastLabelUpdatedAt >= PROGRESS_LABEL_INTERVAL_MS) {
@@ -119,6 +131,8 @@
       lastLabelUpdatedAt = 0;
       progressBar.style.transform = "scaleX(0)";
       phaseText.textContent = "HTTP 응답시간 측정 준비 · 전체 0.0%";
+      progressTrack.setAttribute("aria-valuenow", "0");
+      progressTrack.setAttribute("aria-valuetext", "대기 · 0%");
     }
 
     function setLatencyStep(completedSteps, totalSteps) {
@@ -209,6 +223,10 @@
     function terminate(statusLabel, message) {
       stop();
       phaseText.textContent = `${statusLabel} · 전체 ${currentPercent.toFixed(1)}%${message ? ` · ${message}` : ""}`;
+      progressTrack.setAttribute(
+        "aria-valuetext",
+        `${statusLabel} · ${currentPercent.toFixed(1)}%${message ? ` · ${message}` : ""}`
+      );
     }
 
     return {
@@ -240,6 +258,7 @@
     const actionButtons = root.querySelectorAll("[data-sustained-action]");
     const cancelButton = root.querySelector("[data-sustained-cancel]");
     const statusText = root.querySelector("[data-sustained-status]");
+    const guidance = root.querySelector("[data-sustained-guidance]");
     const phaseText = root.querySelector("[data-sustained-phase]");
     const progressBar = root.querySelector("[data-sustained-progress-bar]");
     const livePanel = root.querySelector("[data-sustained-live]");
@@ -252,6 +271,7 @@
     const technicalDetails = root.querySelector("[data-sustained-technical-details]");
     const excelLink = root.querySelector("[data-sustained-excel]");
     const chartPanel = root.querySelector("[data-sustained-chart-panel]");
+    const resultPanel = statusText.closest("[data-http-criterion-result]");
     const chartCards = new Map(
       Array.from(root.querySelectorAll("[data-sustained-chart-card]"))
         .map((card) => [card.dataset.sustainedChartCard, card])
@@ -307,6 +327,7 @@
         const active = button.dataset.measurementMode === mode;
         button.classList.toggle("is-active", active);
         button.setAttribute("aria-selected", active ? "true" : "false");
+        button.tabIndex = active ? 0 : -1;
       });
       controlPanels.forEach((panel) => {
         panel.hidden = panel.dataset.measurementControl !== mode;
@@ -355,10 +376,29 @@
       durationSelect.disabled = nextRunning;
       cancelButton.disabled = !nextRunning;
       cancelButton.hidden = !nextRunning;
+      resultPanel.setAttribute("aria-busy", nextRunning ? "true" : "false");
+    }
+
+    function setStatus(message, state) {
+      const operationState = state || "idle";
+      const guidanceByState = {
+        idle: "대기 · 측정 방향과 시간을 선택한 뒤 측정을 시작하세요.",
+        running: "진행 중 · 완료되거나 취소될 때까지 중복 실행할 수 없습니다.",
+        success: "완료 · 결과와 변동률을 확인하세요. 완료 표시는 네트워크 정상 판정이 아닙니다.",
+        warning: "취소 · 측정이 중단되었습니다. 필요하면 동일 조건으로 다시 시작하세요.",
+        error: "실패 · 오류 내용과 서버 연결 상태를 확인한 뒤 다시 시도하세요.",
+      };
+      statusText.textContent = message;
+      statusText.setAttribute("aria-live", operationState === "error" ? "assertive" : "polite");
+      setOperationState(statusText, operationState);
+      guidance.textContent = guidanceByState[operationState];
+      guidance.setAttribute("aria-live", operationState === "error" ? "assertive" : "polite");
+      setOperationState(guidance, operationState);
+      progressBar.closest('[role="progressbar"]').dataset.state = operationState;
     }
 
     function resetResult() {
-      statusText.textContent = "준비";
+      setStatus("준비", "idle");
       progress.reset();
       livePanel.hidden = false;
       liveSpeedText.textContent = "측정 준비 중";
@@ -380,7 +420,7 @@
     }
 
     async function measureLatency(signal) {
-      statusText.textContent = "응답시간 측정 중";
+      setStatus("응답시간 측정 중", "running");
       liveSpeedText.textContent = "측정 준비 중";
       const samples = [];
       progress.setLatencyStep(0, 6);
@@ -629,7 +669,15 @@
         excelLink.hidden = false;
         excelLink.setAttribute("download", "");
       }
-      if (result.status !== "success") {
+      const directionEntries = Object.entries(result.directions || {}).filter(
+        ([direction, summary]) => (
+          (direction === "upload" || direction === "download") &&
+          Number(summary && summary.bytes_transferred) > 0 &&
+          Number(summary && summary.actual_duration_seconds) > 0
+        )
+      );
+      const partial = result.status !== "success";
+      if (partial && !directionEntries.length) {
         completedPanel.hidden = true;
         livePanel.hidden = false;
         liveSpeedText.textContent = "결과 없음";
@@ -641,7 +689,20 @@
       summaryList.innerHTML = "";
       detailList.innerHTML = "";
       technicalDetails.open = false;
-      Object.entries(result.directions || {}).forEach(([direction, summary]) => {
+      if (partial) {
+        const partialNotice = document.createElement("div");
+        partialNotice.className = "result-summary-card";
+        const partialHeading = document.createElement("h3");
+        partialHeading.textContent = "부분 완료";
+        const partialText = document.createElement("span");
+        partialText.className = "summary-secondary";
+        partialText.textContent = (
+          "완료된 방향의 결과만 보존했습니다. 실패한 방향만 같은 조건으로 다시 측정하세요."
+        );
+        partialNotice.append(partialHeading, partialText);
+        summaryList.appendChild(partialNotice);
+      }
+      directionEntries.forEach(([direction, summary]) => {
         const label = direction === "upload" ? "업로드" : "다운로드";
         const path = direction === "upload" ? "사용자 PC → 서버" : "서버 → 사용자 PC";
         const averageMbps = Number(summary.average_mbps);
@@ -707,7 +768,9 @@
       }
       const requested = result.requested || {};
       conditionsText.textContent = `${Number(requested.duration_seconds)}초 본 측정 · ${Number(requested.warmup_seconds)}초 워밍업 · HTTP 연결 ${Number(requested.stream_count)}개`;
-      progress.complete();
+      if (!partial) {
+        progress.complete();
+      }
       syncCharts();
       window.requestAnimationFrame(drawCharts);
     }
@@ -726,7 +789,11 @@
     }
 
     async function runAction(direction) {
-      if (running) {
+      if (
+        running ||
+        root.dataset.simpleRunning === "true" ||
+        root.dataset.probeRunning === "true"
+      ) {
         return;
       }
       const durationSeconds = Number.parseInt(durationSelect.value, 10);
@@ -760,7 +827,7 @@
           "HTTP 시간 기준 측정 시작"
         );
         activeSessionId = session.session_id;
-        statusText.textContent = "측정 중";
+        setStatus("측정 중", "running");
         progress.configure(direction, session.warmup_seconds, session.duration_seconds);
 
         if (direction === "upload" || direction === "full") {
@@ -775,7 +842,12 @@
           latency_samples_ms: latencySamples,
           results: clientResults,
         });
-        statusText.textContent = "완료";
+        if (completed.status === "success") {
+          setStatus("완료", "success");
+        } else {
+          setStatus("실패", "error");
+          progress.terminate("실패", completed.error || "측정 결과가 유효하지 않습니다.");
+        }
         renderCompletedResult(completed);
       } catch (error) {
         const errorMessage = error.message || "측정 중 오류가 발생했습니다.";
@@ -793,7 +865,10 @@
             savedResult = null;
           }
         }
-        statusText.textContent = cancellationRequested ? "취소됨" : "실패";
+        setStatus(
+          cancellationRequested ? "취소됨" : "실패",
+          cancellationRequested ? "warning" : "error"
+        );
         if (savedResult) {
           renderCompletedResult(savedResult);
         }

@@ -35,6 +35,10 @@ class UploadConcurrencyError(RuntimeError):
     pass
 
 
+INSTANCE_LOCK_RETRY_ATTEMPTS = 5
+INSTANCE_LOCK_RETRY_INTERVAL_SECONDS = 0.05
+
+
 DIAGNOSTIC_LOG_MAX_BYTES = 2 * 1024 * 1024
 DIAGNOSTIC_LOG_BACKUP_COUNT = 5
 LOW_FREE_SPACE_WARNING_BYTES = 1024 * 1024 * 1024
@@ -510,13 +514,21 @@ class DataDirectoryLock:
                 "데이터 폴더의 단일 실행 잠금 파일을 준비할 수 없습니다."
             ) from exc
 
-        try:
-            _lock_file(handle)
-        except (OSError, BlockingIOError) as exc:
+        lock_error: OSError | None = None
+        for attempt in range(INSTANCE_LOCK_RETRY_ATTEMPTS):
+            try:
+                _lock_file(handle)
+                lock_error = None
+                break
+            except OSError as exc:
+                lock_error = exc
+                if attempt + 1 < INSTANCE_LOCK_RETRY_ATTEMPTS:
+                    time.sleep(INSTANCE_LOCK_RETRY_INTERVAL_SECONDS)
+        if lock_error is not None:
             handle.close()
             raise InstanceLockError(
                 "같은 데이터 폴더를 사용하는 사내 업로드 서버가 이미 실행 중입니다."
-            ) from exc
+            ) from lock_error
 
         try:
             metadata = json.dumps(

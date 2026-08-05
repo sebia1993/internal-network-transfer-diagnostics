@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
+from pathlib import Path
 
 from flask import Flask
 from openpyxl import load_workbook
@@ -200,3 +201,86 @@ def test_probe_excel_route_handles_saved_missing_and_corrupt_results(tmp_path):
     (service.config.results_root / f"{corrupt_id}.json").write_text("{not-json", encoding="utf-8")
     corrupt = client.get(f"/api/network-probe/results/{corrupt_id}.xlsx")
     assert corrupt.status_code == 500
+
+
+def test_probe_json_download_reads_result_once_and_preserves_payload(
+    tmp_path,
+    monkeypatch,
+):
+    service, _ = build_service(tmp_path, enabled=False)
+    app = Flask(__name__)
+    app.register_blueprint(create_probe_blueprint(service))
+    client = app.test_client()
+    result_path = service.config.results_root / f"{SESSION_ID}.json"
+    expected_text = json.dumps(sample_probe_result(), ensure_ascii=False, indent=2)
+    result_path.write_text(expected_text, encoding="utf-8")
+    original_read_text = Path.read_text
+    result_read_count = 0
+
+    def counted_read_text(path: Path, *args, **kwargs):
+        nonlocal result_read_count
+        if path == result_path:
+            result_read_count += 1
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+
+    response = client.get(f"/api/network-probe/results/{SESSION_ID}.json")
+
+    assert response.status_code == 200
+    assert response.get_data(as_text=True) == expected_text
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert result_read_count == 1
+    missing = client.get(f"/api/network-probe/results/{'f' * 32}.json")
+    assert missing.status_code == 404
+    assert missing.is_json
+
+
+def test_probe_json_download_returns_safe_error_when_result_read_fails(
+    tmp_path,
+    monkeypatch,
+):
+    service, _ = build_service(tmp_path, enabled=False)
+    app = Flask(__name__)
+    app.register_blueprint(create_probe_blueprint(service))
+    client = app.test_client()
+    result_path = service.config.results_root / f"{SESSION_ID}.json"
+    result_path.write_text(json.dumps(sample_probe_result()), encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def deleting_read_text(path: Path, *args, **kwargs):
+        if path == result_path:
+            path.unlink()
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deleting_read_text)
+
+    response = client.get(f"/api/network-probe/results/{SESSION_ID}.json")
+
+    assert response.status_code == 500
+    assert response.is_json
+    assert "RESULT_READ_FAILED" in response.json["error"]
+    assert "FileNotFoundError" not in response.json["error"]
+    assert str(result_path) not in response.json["error"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_probe_json_download_returns_safe_error_for_invalid_utf8(tmp_path):
+    service, _ = build_service(tmp_path, enabled=False)
+    app = Flask(__name__)
+    app.register_blueprint(create_probe_blueprint(service))
+    client = app.test_client()
+    result_path = service.config.results_root / f"{SESSION_ID}.json"
+    result_path.write_bytes(b"\xff\xfe\x00")
+
+    response = client.get(f"/api/network-probe/results/{SESSION_ID}.json")
+
+    assert response.status_code == 500
+    assert response.is_json
+    assert "RESULT_READ_FAILED" in response.json["error"]
+    assert "UnicodeDecodeError" not in response.json["error"]
+    assert str(result_path) not in response.json["error"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"

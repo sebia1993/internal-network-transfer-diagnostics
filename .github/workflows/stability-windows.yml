@@ -56,10 +56,24 @@ jobs:
             --duration-minutes $env:SOAK_DURATION_MINUTES `
             --summary-path windows-soak-summary.json
 
-      - name: Write soak summary
+      - name: Analyze soak resource trend
+        shell: pwsh
+        run: |
+          python tools/analyze_windows_soak_summary.py `
+            windows-soak-summary.json `
+            --minimum-duration-minutes $env:SOAK_DURATION_MINUTES `
+            --output windows-soak-analysis.json
+
+      - name: Write soak evidence
         if: always()
         shell: pwsh
         run: |
+          if (Test-Path windows-soak-analysis.json) {
+            "## Windows stability analysis" >> $env:GITHUB_STEP_SUMMARY
+            "``````json" >> $env:GITHUB_STEP_SUMMARY
+            Get-Content windows-soak-analysis.json >> $env:GITHUB_STEP_SUMMARY
+            "``````" >> $env:GITHUB_STEP_SUMMARY
+          }
           if (Test-Path windows-soak-summary.json) {
             "## Windows stability soak" >> $env:GITHUB_STEP_SUMMARY
             "``````json" >> $env:GITHUB_STEP_SUMMARY
