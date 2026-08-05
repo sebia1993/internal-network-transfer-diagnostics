@@ -77,6 +77,24 @@ def build_service(
     return service, gate
 
 
+def wait_for_session_persistence(
+    service: ProbeService,
+    session_id: str,
+    *,
+    timeout: float = 3.0,
+) -> dict:
+    with service.condition:
+        completed = service.condition.wait_for(
+            lambda: (
+                session_id in service.sessions
+                and service.sessions[session_id].persistence_complete
+            ),
+            timeout=timeout,
+        )
+    assert completed, "TCP probe result persistence did not complete"
+    return service.session_status(session_id)
+
+
 def check_connectivity(
     service: ProbeService,
     registration: dict,
@@ -679,8 +697,7 @@ def test_probe_stream_attach_timeout_fails_session_and_releases_gate(tmp_path, m
         )
         service.next_job(registration["agent_id"], registration["agent_token"], "127.0.0.1")
 
-        time.sleep(0.15)
-        status = service.session_status(created["session_id"])
+        status = wait_for_session_persistence(service, created["session_id"])
 
         assert status["status"] == "failed"
         assert "연결 시간이 초과" in status["error"]
@@ -702,8 +719,7 @@ def test_probe_unclaimed_job_timeout_fails_session_and_releases_gate(tmp_path, m
             stream_count=1,
         )
 
-        time.sleep(0.15)
-        status = service.session_status(created["session_id"])
+        status = wait_for_session_persistence(service, created["session_id"])
 
         assert status["status"] == "failed"
         assert "작업을 가져오지 않았습니다" in status["error"]
@@ -730,8 +746,7 @@ def test_probe_result_submission_timeout_fails_session_and_releases_gate(tmp_pat
         )["job"]
 
         run_client_phase(service, registration, job, "upload", complete=False)
-        time.sleep(0.15)
-        status = service.session_status(created["session_id"])
+        status = wait_for_session_persistence(service, created["session_id"])
 
         assert status["status"] == "failed"
         assert "결과 수신 시간이 초과" in status["error"]
@@ -970,15 +985,23 @@ def test_probe_result_urls_wait_until_persistence_succeeds(tmp_path, monkeypatch
     assert service.start() is True
     persistence_started = threading.Event()
     allow_persistence = threading.Event()
+    gate_release_observations = []
     cancellation_result = []
     errors = []
     original_persist = service._persist_result
+    original_gate_release = gate.release
 
     def blocking_persist(session):
         persistence_started.set()
         if not allow_persistence.wait(timeout=3):
             raise TimeoutError("test persistence was not released")
         original_persist(session)
+
+    def blocking_gate_release(kind, owner_id):
+        gate_release_observations.append(
+            service.sessions[owner_id].persistence_complete
+        )
+        return original_gate_release(kind, owner_id)
 
     try:
         registration = register(service)
@@ -990,6 +1013,7 @@ def test_probe_result_urls_wait_until_persistence_succeeds(tmp_path, monkeypatch
         )
         session_id = created["session_id"]
         monkeypatch.setattr(service, "_persist_result", blocking_persist)
+        monkeypatch.setattr(gate, "release", blocking_gate_release)
 
         def cancel_session():
             try:
@@ -1015,6 +1039,7 @@ def test_probe_result_urls_wait_until_persistence_succeeds(tmp_path, monkeypatch
         assert not thread.is_alive()
         assert errors == []
         assert len(cancellation_result) == 1
+        assert gate_release_observations == [False]
         completed = cancellation_result[0]
         assert completed["persistence_complete"] is True
         assert completed["result_available"] is True

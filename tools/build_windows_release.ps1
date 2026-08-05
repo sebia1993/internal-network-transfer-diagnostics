@@ -237,6 +237,8 @@ TCP 전송 성능 측정:
 - 현재 소스 근거, 사용자별 평가와 P0/P1/P2 계획을 담은 한국어 진단 보고서 추가
 - Windows PowerShell 5.1 한국어와 CMD 실행을 각각 UTF-8 BOM/no-BOM으로 고정하고 local/Actions native 실패를 즉시 전파
 - Actions checkout 뒤 원격 tag ref를 다시 받아 annotated tag object와 source commit 일치를 검증
+- 이전 ``v0.5.1`` tag workflow는 Windows 비동기 timeout 테스트 경합으로 중단됐고 Release asset은 생성되지 않음
+- TCP timeout 테스트는 ``persistence_complete``까지 기다리며, 저장 후 gate 해제와 완료 플래그 공개를 같은 임계구역에서 처리
 - 기존 업로드·다운로드 URL, CSV·JSON·Excel 형식과 TCP 프로토콜 ``v2`` 유지
 
 ## 검증

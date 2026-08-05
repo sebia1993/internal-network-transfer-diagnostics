@@ -6,10 +6,18 @@
 
 - 현재 예정된 변경사항이 없습니다.
 
+## v0.5.2 - 2026-08-05
+
+- `v0.5.1`은 원격 annotated tag 검증을 통과했지만 Windows CI에서 TCP timeout 세션의 결과 영속화가 끝나기 전에 measurement gate를 확인한 테스트 3건이 경합으로 실패해 GitHub Release와 asset은 생성되지 않았습니다.
+- timeout 회귀 테스트가 `persistence_complete`까지 제한 시간 안에 기다린 뒤 gate 해제를 검증하도록 바꿔, 결과 저장 전 새 측정을 막는 기존 안전 계약을 유지하면서 실행 환경 속도에 좌우되지 않게 했습니다.
+- TCP 결과 저장 뒤에는 measurement gate를 먼저 해제하고 같은 임계구역에서 `persistence_complete`를 공개해, 완료로 보인 직후 새 측정이 일시적으로 거절되는 경합도 제거했습니다.
+- `v0.5.0`과 `v0.5.1`의 실패 태그는 이동하거나 삭제하지 않고 이력으로 보존하며, 이전 버전에 준비한 모든 사용성·안정성 개선과 호환성 계약을 그대로 포함합니다.
+
 ## v0.5.1 - 2026-08-05
 
 - `v0.5.0` annotated tag push는 Actions checkout이 로컬 tag ref를 commit으로 평탄화해 immutable-tag 검사에서 빌드 전에 중단됐으며 GitHub Release와 asset은 생성되지 않았습니다.
 - 릴리스 workflow가 원격의 정확한 tag ref를 force-fetch한 뒤 object type과 checkout commit을 검사하도록 수정했습니다.
+- 원격 tag 검증은 통과했지만 Windows CI의 비동기 timeout 테스트 3건이 결과 영속화 완료 전 gate를 확인해 실패했으며, GitHub Release와 asset은 생성되지 않았습니다.
 - `v0.5.0`에 준비한 모든 사용성·안정성 개선, URL·저장 형식·TCP 프로토콜 `v2` 호환성과 검증 계약을 그대로 포함합니다.
 
 ## v0.5.0 - 2026-08-05
