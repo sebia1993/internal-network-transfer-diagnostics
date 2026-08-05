@@ -5,6 +5,7 @@ import json
 import hashlib
 import socket
 import uuid
+from dataclasses import replace
 from zipfile import ZipFile
 
 from app_version import APP_VERSION
@@ -12,6 +13,7 @@ from app import build_probe_config, create_app, load_config, normalize_ip
 from network_measurement import NetworkMeasurementGate
 from network_probe.models import PROBE_PROTOCOL_VERSION
 from network_probe.protocol import recv_frame, send_frame
+import network_probe.service as service_module
 from network_probe.service import ProbeService
 
 
@@ -92,6 +94,64 @@ def test_disabled_probe_api_and_ui_are_available(tmp_path):
     assert "Windows 클라이언트 ZIP 받기" in index_text
     assert 'data-probe-client-package-url="/api/network-probe/client-package.zip"' in index_text
     assert "network_probe.js" in index_text
+
+
+def test_probe_bind_failure_uses_safe_error_in_status_health_and_api(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = write_config(tmp_path, enabled=True)
+    app_config = load_config(config_path)
+    gate = NetworkMeasurementGate()
+    probe_config = replace(build_probe_config(app_config), host="127.0.0.1")
+    service = ProbeService(
+        config=probe_config,
+        measurement_gate=gate,
+        normalize_ip=normalize_ip,
+    )
+
+    class FailingSocket:
+        def setsockopt(self, *args):
+            return None
+
+        def bind(self, *args):
+            raise OSError("sensitive-customer-bind-detail")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(service_module.socket, "socket", lambda *args, **kwargs: FailingSocket())
+
+    assert service.start() is False
+    app = create_app(config_path, probe_service=service, measurement_gate=gate)
+    client = app.test_client()
+
+    status = client.get("/api/network-probe/status")
+    health = client.get("/api/health")
+    registration = client.post(
+        "/api/network-probe/agents/register",
+        json={
+            "agent_id": uuid.uuid4().hex,
+            "hostname": "TEST-PC",
+            "server_host": "127.0.0.1",
+            "protocol_version": PROBE_PROTOCOL_VERSION,
+            "client_version": APP_VERSION,
+        },
+    )
+
+    combined = (
+        status.get_data(as_text=True)
+        + health.get_data(as_text=True)
+        + registration.get_data(as_text=True)
+    )
+    assert status.status_code == 200
+    assert "no-store" in status.headers["Cache-Control"]
+    assert status.headers["X-Content-Type-Options"] == "nosniff"
+    assert health.status_code == 200
+    assert registration.status_code == 503
+    assert "TCP_BIND_FAILED" in combined
+    assert "sensitive-customer-bind-detail" not in combined
+    assert service.diagnostic_status()["last_event"] == "tcp_listener_bind_failed"
 
 
 def test_probe_api_registers_agent_and_shares_measurement_gate(tmp_path):

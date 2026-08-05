@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
-import os
 import statistics
 import threading
 import time
@@ -16,8 +16,13 @@ from typing import Any, Callable
 
 from flask import Blueprint, Response, jsonify, request, send_file, stream_with_context
 
+from measurement_transactions import (
+    commit_measurement_result,
+    has_pending_measurement_transactions,
+    measurement_transaction_root_for_log,
+)
 from network_measurement import NetworkMeasurementGate
-from result_storage import prune_old_json_results, write_json_atomically
+from result_storage import prune_old_json_results
 from runtime_stability import CsvIntegrityError, archive_csv_history
 from sustained_excel import (
     EXCEL_MIME_TYPE,
@@ -47,6 +52,8 @@ SUSTAINED_LOG_FIELDS = [
     "error",
     "result_json",
 ]
+SUCCESS_BYTE_RELATIVE_TOLERANCE = 0.05
+SUCCESS_BYTE_MIN_TOLERANCE_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -99,6 +106,47 @@ def ensure_sustained_storage(log_path: Path, results_root: Path) -> None:
         return
     with log_path.open("w", encoding="utf-8-sig", newline="") as handle:
         csv.DictWriter(handle, fieldnames=SUSTAINED_LOG_FIELDS).writeheader()
+
+
+def build_sustained_log_rows(
+    result: dict[str, Any],
+) -> list[dict[str, object]]:
+    result_json = (
+        "data/network_check_results/"
+        f"{result['session_id']}.json"
+    )
+    rows: list[dict[str, object]] = []
+    for direction in ("upload", "download"):
+        summary = result["directions"].get(direction)
+        if summary is None:
+            continue
+        rows.append(
+            {
+                "checked_at": result["completed_at"],
+                "session_id": result["session_id"],
+                "client_ip": result["client_ip"],
+                "direction": direction,
+                "duration_seconds": result["requested"]["duration_seconds"],
+                "warmup_seconds": result["requested"]["warmup_seconds"],
+                "stream_count": result["requested"]["stream_count"],
+                "bytes_transferred": summary["bytes_transferred"],
+                "actual_duration_seconds": summary[
+                    "actual_duration_seconds"
+                ],
+                "average_mbps": summary["average_mbps"],
+                "median_mbps": summary["median_mbps"],
+                "min_mbps": summary["min_mbps"],
+                "max_mbps": summary["max_mbps"],
+                "variability_percent": summary["variability_percent"],
+                "http_latency_median_ms": (
+                    result["http_latency"]["median_ms"] or ""
+                ),
+                "status": result["status"],
+                "error": result["error"],
+                "result_json": result_json,
+            }
+        )
+    return rows
 
 
 def calculate_mbps(byte_count: int, duration_seconds: float) -> float:
@@ -161,17 +209,61 @@ class SustainedCheckManager:
         settings: SustainedCheckSettings | None = None,
         measurement_gate: NetworkMeasurementGate | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        diagnostic_logger: logging.Logger | None = None,
     ) -> None:
         self.log_path = log_path
         self.results_root = results_root
         self.settings = settings or SustainedCheckSettings()
         self.measurement_gate = measurement_gate
         self.clock = clock
+        self.diagnostic_logger = diagnostic_logger or logging.getLogger(__name__)
         self.lock = threading.RLock()
         self.storage_lock = threading.Lock()
+        self.diagnostic_failure_count = 0
+        self.last_diagnostic_event = ""
+        self.last_diagnostic_error_type = ""
         self.active_session: SustainedSession | None = None
         ensure_sustained_storage(log_path, results_root)
         self.download_chunk = bytes(index % 251 for index in range(self.settings.download_chunk_bytes))
+
+    def _record_diagnostic_failure(
+        self,
+        event: str,
+        exc: BaseException,
+        *,
+        warning: bool = False,
+    ) -> None:
+        error_type = type(exc).__name__
+        with self.lock:
+            self.diagnostic_failure_count += 1
+            self.last_diagnostic_event = event
+            self.last_diagnostic_error_type = error_type
+        log_method = (
+            self.diagnostic_logger.warning
+            if warning
+            else self.diagnostic_logger.error
+        )
+        log_method("%s error_type=%s", event, error_type)
+
+    def diagnostic_status(self) -> dict[str, str | int]:
+        with self.lock:
+            return {
+                "failure_count": self.diagnostic_failure_count,
+                "last_event": self.last_diagnostic_event,
+                "last_error_type": self.last_diagnostic_error_type,
+            }
+
+    def _raise_if_measurement_recovery_pending_locked(self) -> None:
+        if has_pending_measurement_transactions(
+            measurement_transaction_root_for_log(self.log_path),
+            "http_sustained",
+        ):
+            raise SustainedCheckError(
+                "이전 HTTP 측정 결과 복구가 필요합니다. 오류 코드: "
+                "MEASUREMENT_RECOVERY_PENDING. 서버를 다시 시작한 뒤 "
+                "재측정하세요.",
+                503,
+            )
 
     def start_session(
         self,
@@ -190,12 +282,19 @@ class SustainedCheckManager:
             raise SustainedCheckError("HTTP 시간 기준 측정은 1개 연결만 지원합니다.")
 
         now = self.clock()
-        session_id = uuid.uuid4().hex
         with self.lock:
             if self.active_session is not None:
                 raise SustainedCheckError("다른 HTTP 시간 기준 측정이 진행 중입니다.", 409)
+            with self.storage_lock:
+                self._raise_if_measurement_recovery_pending_locked()
+            session_id = uuid.uuid4().hex
             if self.measurement_gate is not None and not self.measurement_gate.acquire(
-                "http_sustained", session_id
+                "http_sustained",
+                session_id,
+                cancel_callback=lambda expected_session_id=session_id: self.close(
+                    "최대 실행 시간을 초과하여 HTTP 시간 기준 측정이 중단되었습니다.",
+                    expected_session_id=expected_session_id,
+                ),
             ):
                 raise SustainedCheckError("다른 네트워크 측정이 진행 중입니다.", 409)
             session = SustainedSession(
@@ -227,7 +326,13 @@ class SustainedCheckManager:
                     continue
                 try:
                     self.cleanup_expired()
-                except Exception:
+                except SustainedCheckError:
+                    return
+                except Exception as exc:
+                    self._record_diagnostic_failure(
+                        "http_sustained_expiry_cleanup_failed",
+                        exc,
+                    )
                     return
                 with self.lock:
                     session = self.active_session
@@ -334,11 +439,38 @@ class SustainedCheckManager:
                 raise SustainedCheckError("모든 측정 단계가 완료되지 않았습니다.", 409)
             if status == "success" and self.clock() + 0.05 < session.phase_deadline:
                 raise SustainedCheckError("현재 측정 단계가 아직 진행 중입니다.", 409)
-            result = self._build_result(session, payload, status=status)
+            result_payload = payload
+            result_status = status
+            if status == "success":
+                try:
+                    self._validate_success_client_results(session, payload)
+                except SustainedCheckError as exc:
+                    result_status = "failure"
+                    result_payload = {
+                        "latency_samples_ms": payload.get("latency_samples_ms", []),
+                        "results": {},
+                        "error": str(exc),
+                    }
+            result = self._build_result(session, result_payload, status=result_status)
             try:
-                self._persist_result(result)
-                session.status = status
-                session.error = result["error"]
+                try:
+                    self._persist_result(result)
+                except SustainedCheckError:
+                    raise
+                except Exception as exc:
+                    self._record_diagnostic_failure(
+                        "http_sustained_result_persistence_failed",
+                        exc,
+                    )
+                    raise SustainedCheckError(
+                        "측정 결과를 저장하지 못했습니다. 오류 코드: "
+                        "RESULT_WRITE_FAILED. 서버 진단 로그를 확인한 뒤 다시 "
+                        "측정하세요.",
+                        500,
+                    ) from None
+                else:
+                    session.status = result_status
+                    session.error = result["error"]
             finally:
                 self.active_session = None
                 if self.measurement_gate is not None:
@@ -347,6 +479,51 @@ class SustainedCheckManager:
 
     def cancel(self, session_id: str, client_ip: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.complete(session_id, client_ip, payload or {}, status="cancelled")
+
+    def close(
+        self,
+        reason: str = "서버 종료로 HTTP 시간 기준 측정이 중단되었습니다.",
+        *,
+        expected_session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self.lock:
+            session = self.active_session
+            if session is None or (
+                expected_session_id is not None
+                and session.session_id != expected_session_id
+            ):
+                return None
+            result = self._build_result(
+                session,
+                {"error": reason},
+                status="failure",
+            )
+            try:
+                try:
+                    self._persist_result(result)
+                except SustainedCheckError:
+                    raise
+                except Exception as exc:
+                    self._record_diagnostic_failure(
+                        "http_sustained_shutdown_persistence_failed",
+                        exc,
+                    )
+                    raise SustainedCheckError(
+                        "종료 중 측정 결과를 저장하지 못했습니다. 오류 코드: "
+                        "RESULT_WRITE_FAILED.",
+                        500,
+                    ) from None
+                else:
+                    session.status = "failure"
+                    session.error = result["error"]
+            finally:
+                self.active_session = None
+                if self.measurement_gate is not None:
+                    self.measurement_gate.release(
+                        "http_sustained",
+                        session.session_id,
+                    )
+            return result
 
     def cleanup_expired(self) -> None:
         with self.lock:
@@ -359,7 +536,20 @@ class SustainedCheckManager:
                 status="failure",
             )
             try:
-                self._persist_result(result)
+                try:
+                    self._persist_result(result)
+                except SustainedCheckError:
+                    raise
+                except Exception as exc:
+                    self._record_diagnostic_failure(
+                        "http_sustained_expiry_persistence_failed",
+                        exc,
+                    )
+                    raise SustainedCheckError(
+                        "만료된 측정 결과를 저장하지 못했습니다. 오류 코드: "
+                        "RESULT_WRITE_FAILED.",
+                        500,
+                    ) from None
             finally:
                 self.active_session = None
                 if self.measurement_gate is not None:
@@ -373,17 +563,34 @@ class SustainedCheckManager:
             raise SustainedCheckError("측정 결과를 찾을 수 없습니다.", 404)
         return result_path
 
-    def saved_result_for(self, session_id: str, client_ip: str) -> dict[str, Any]:
+    def _read_result_payload(self, session_id: str) -> tuple[str, dict[str, Any]]:
         result_path = self._result_path(session_id)
         try:
-            saved = json.loads(result_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise SustainedCheckError("측정 결과 파일을 읽을 수 없습니다.", 500) from exc
+            result_text = result_path.read_text(encoding="utf-8")
+            saved = json.loads(result_text)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise SustainedCheckError(
+                "측정 결과 파일을 읽을 수 없습니다. 오류 코드: RESULT_READ_FAILED.",
+                500,
+            ) from exc
         if not isinstance(saved, dict):
             raise SustainedCheckError("측정 결과 파일 형식이 올바르지 않습니다.", 500)
+        return result_text, saved
+
+    @staticmethod
+    def _ensure_result_owner(saved: dict[str, Any], client_ip: str) -> None:
         if saved.get("client_ip") != client_ip:
             raise SustainedCheckError("이 측정 결과는 다른 IP에서 받을 수 없습니다.", 403)
+
+    def saved_result_for(self, session_id: str, client_ip: str) -> dict[str, Any]:
+        _, saved = self._read_result_payload(session_id)
+        self._ensure_result_owner(saved, client_ip)
         return saved
+
+    def result_text_for(self, session_id: str, client_ip: str) -> str:
+        result_text, saved = self._read_result_payload(session_id)
+        self._ensure_result_owner(saved, client_ip)
+        return result_text
 
     def result_path_for(self, session_id: str, client_ip: str) -> Path:
         result_path = self._result_path(session_id)
@@ -417,7 +624,19 @@ class SustainedCheckManager:
                         interval_bytes=session.measured_intervals[direction],
                     )
                 else:
-                    directions[direction] = self._validated_client_result(client_result, session.duration_seconds)
+                    try:
+                        directions[direction] = self._validated_client_result(
+                            client_result,
+                            session.duration_seconds,
+                        )
+                    except SustainedCheckError:
+                        if status == "success":
+                            raise
+                        directions[direction] = summarize_intervals(
+                            byte_count=session.measured_bytes[direction],
+                            duration_seconds=float(session.duration_seconds),
+                            interval_bytes=session.measured_intervals[direction],
+                        )
 
         error = str(payload.get("error", "")).strip()[:500]
         return {
@@ -453,6 +672,132 @@ class SustainedCheckManager:
             if math.isfinite(number) and 0 <= number <= 60_000:
                 samples.append(round(number, 3))
         return samples
+
+    def _validate_success_client_results(
+        self,
+        session: SustainedSession,
+        payload: dict[str, Any],
+    ) -> None:
+        client_results = payload.get("results")
+        if not isinstance(client_results, dict):
+            raise SustainedCheckError("성공 결과에 브라우저 측 전송 결과가 없습니다.")
+
+        expected_directions = (
+            ["upload", "download"]
+            if session.requested_direction == "full"
+            else [session.requested_direction]
+        )
+        for direction in expected_directions:
+            label = "업로드" if direction == "upload" else "다운로드"
+            value = client_results.get(direction)
+            if not isinstance(value, dict):
+                raise SustainedCheckError(
+                    f"성공 결과에 {label} 브라우저 측 전송 결과가 없습니다."
+                )
+            try:
+                declared_bytes = int(value.get("bytes_transferred", 0))
+                duration = float(value.get("actual_duration_seconds", 0))
+            except (TypeError, ValueError) as exc:
+                raise SustainedCheckError(
+                    f"{label} 브라우저 측 전송 결과 형식이 올바르지 않습니다."
+                ) from exc
+            if declared_bytes <= 0:
+                raise SustainedCheckError(
+                    f"{label} 브라우저 측 전송량이 없어 성공으로 저장할 수 없습니다."
+                )
+            if (
+                not math.isfinite(duration)
+                or duration <= 0
+                or duration > session.duration_seconds + 5
+            ):
+                raise SustainedCheckError(
+                    f"{label} 브라우저 측 측정 시간이 올바르지 않습니다."
+                )
+
+            raw_intervals = value.get("intervals")
+            if (
+                not isinstance(raw_intervals, list)
+                or not raw_intervals
+                or len(raw_intervals) > session.duration_seconds + 2
+            ):
+                raise SustainedCheckError(
+                    f"{label} 브라우저 측 구간 결과가 올바르지 않습니다."
+                )
+
+            interval_bytes = 0
+            for item in raw_intervals:
+                if not isinstance(item, dict):
+                    raise SustainedCheckError(
+                        f"{label} 브라우저 측 구간 결과가 올바르지 않습니다."
+                    )
+                try:
+                    bytes_in_interval = int(item.get("bytes_transferred", -1))
+                    interval_duration = float(item.get("duration_seconds", 0))
+                except (TypeError, ValueError) as exc:
+                    raise SustainedCheckError(
+                        f"{label} 브라우저 측 구간 결과가 올바르지 않습니다."
+                    ) from exc
+                if (
+                    bytes_in_interval < 0
+                    or not math.isfinite(interval_duration)
+                    or interval_duration <= 0
+                    or interval_duration > 5
+                ):
+                    raise SustainedCheckError(
+                        f"{label} 브라우저 측 구간 결과가 올바르지 않습니다."
+                    )
+                interval_bytes += bytes_in_interval
+
+            if interval_bytes <= 0:
+                raise SustainedCheckError(
+                    f"{label} 브라우저 측 구간 전송량이 없어 성공으로 저장할 수 없습니다."
+                )
+
+            chunk_bytes = (
+                self.settings.max_upload_chunk_bytes
+                if direction == "upload"
+                else self.settings.download_chunk_bytes
+            )
+            if not self._byte_counts_match(
+                declared_bytes,
+                interval_bytes,
+                chunk_bytes=chunk_bytes,
+                stream_count=session.stream_count,
+            ):
+                raise SustainedCheckError(
+                    f"{label} 브라우저 측 전체 전송량과 구간 전송량 합계가 일치하지 않습니다."
+                )
+
+            server_bytes = int(session.measured_bytes.get(direction, 0))
+            if server_bytes <= 0:
+                raise SustainedCheckError(
+                    f"{label} 서버 측 전송량이 없어 성공으로 저장할 수 없습니다."
+                )
+            if not self._byte_counts_match(
+                declared_bytes,
+                server_bytes,
+                chunk_bytes=chunk_bytes,
+                stream_count=session.stream_count,
+            ):
+                raise SustainedCheckError(
+                    f"{label} 브라우저 측 전송량과 서버 측 전송량 차이가 허용 범위를 벗어났습니다."
+                )
+
+    @staticmethod
+    def _byte_counts_match(
+        first: int,
+        second: int,
+        *,
+        chunk_bytes: int,
+        stream_count: int,
+    ) -> bool:
+        reference = max(abs(int(first)), abs(int(second)), 1)
+        streams = max(int(stream_count), 1)
+        minimum = SUCCESS_BYTE_MIN_TOLERANCE_BYTES * streams
+        chunk_cap = max(int(chunk_bytes) * streams, minimum)
+        relative = math.ceil(reference * SUCCESS_BYTE_RELATIVE_TOLERANCE)
+        tolerance = min(max(relative, minimum), chunk_cap)
+        return abs(int(first) - int(second)) <= tolerance
 
     @staticmethod
     def _validated_client_result(value: Any, requested_duration: int) -> dict[str, Any]:
@@ -491,51 +836,33 @@ class SustainedCheckManager:
     def _persist_result(self, result: dict[str, Any]) -> None:
         ensure_sustained_storage(self.log_path, self.results_root)
         result_path = self.results_root / f"{result['session_id']}.json"
-        relative_result_path = f"data/network_check_results/{result_path.name}"
+        rows = build_sustained_log_rows(result)
         with self.storage_lock:
-            original_log_size = self.log_path.stat().st_size
-            write_json_atomically(result_path, result)
-            try:
-                with self.log_path.open("a", encoding="utf-8", newline="") as handle:
-                    writer = csv.DictWriter(handle, fieldnames=SUSTAINED_LOG_FIELDS)
-                    for direction, summary in result["directions"].items():
-                        writer.writerow(
-                            {
-                                "checked_at": result["completed_at"],
-                                "session_id": result["session_id"],
-                                "client_ip": result["client_ip"],
-                                "direction": direction,
-                                "duration_seconds": result["requested"]["duration_seconds"],
-                                "warmup_seconds": result["requested"]["warmup_seconds"],
-                                "stream_count": result["requested"]["stream_count"],
-                                "bytes_transferred": summary["bytes_transferred"],
-                                "actual_duration_seconds": summary["actual_duration_seconds"],
-                                "average_mbps": summary["average_mbps"],
-                                "median_mbps": summary["median_mbps"],
-                                "min_mbps": summary["min_mbps"],
-                                "max_mbps": summary["max_mbps"],
-                                "variability_percent": summary["variability_percent"],
-                                "http_latency_median_ms": result["http_latency"]["median_ms"] or "",
-                                "status": result["status"],
-                                "error": result["error"],
-                                "result_json": relative_result_path,
-                            }
-                        )
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except Exception:
-                try:
-                    with self.log_path.open("r+b") as handle:
-                        handle.truncate(original_log_size)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                finally:
-                    result_path.unlink(missing_ok=True)
-                raise
+            self._raise_if_measurement_recovery_pending_locked()
+            marker_removed = commit_measurement_result(
+                source="http_sustained",
+                result_path=result_path,
+                result=result,
+                log_path=self.log_path,
+                fieldnames=SUSTAINED_LOG_FIELDS,
+                key_field="direction",
+                rows=rows,
+            )
+            if not marker_removed:
+                self._record_diagnostic_failure(
+                    "http_sustained_transaction_cleanup_failed",
+                    OSError("measurement transaction cleanup failed"),
+                    warning=True,
+                )
+                return
             try:
                 archive_csv_history(self.log_path, SUSTAINED_LOG_FIELDS)
-            except (OSError, CsvIntegrityError):
-                pass
+            except (OSError, CsvIntegrityError) as exc:
+                self._record_diagnostic_failure(
+                    "http_sustained_csv_archive_failed",
+                    exc,
+                    warning=True,
+                )
             prune_old_json_results(self.results_root)
 
 
@@ -547,6 +874,7 @@ def create_sustained_blueprint(
     settings: SustainedCheckSettings | None = None,
     measurement_gate: NetworkMeasurementGate | None = None,
     clock: Callable[[], float] = time.perf_counter,
+    diagnostic_logger: logging.Logger | None = None,
 ) -> tuple[Blueprint, SustainedCheckManager]:
     manager = SustainedCheckManager(
         log_path=log_path,
@@ -554,8 +882,15 @@ def create_sustained_blueprint(
         settings=settings,
         measurement_gate=measurement_gate,
         clock=clock,
+        diagnostic_logger=diagnostic_logger,
     )
     blueprint = Blueprint("sustained_network", __name__)
+
+    @blueprint.after_request
+    def disable_sensitive_response_caching(response):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     def client_ip() -> str:
         return normalize_ip(request.remote_addr)
@@ -684,11 +1019,11 @@ def create_sustained_blueprint(
     @blueprint.get("/network-check/sustained/results/<session_id>.json")
     def result_json(session_id: str):
         try:
-            result_path = manager.result_path_for(session_id, client_ip())
+            result_text = manager.result_text_for(session_id, client_ip())
         except SustainedCheckError as exc:
             return error_response(exc)
         return Response(
-            result_path.read_text(encoding="utf-8"),
+            result_text,
             mimetype="application/json",
             headers={"Content-Disposition": f'attachment; filename="network-check-{session_id}.json"'},
         )

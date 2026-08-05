@@ -1,5 +1,6 @@
 import csv
 import json
+import logging
 import time
 from io import BytesIO
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 from openpyxl import load_workbook
 
+import measurement_transactions as transaction_module
 from app import create_app
 from network_measurement import NetworkMeasurementGate
 from network_sustained import (
@@ -43,6 +45,51 @@ def create_manager(tmp_path: Path, clock: FakeClock, *, ttl: float = 300) -> Sus
         settings=SustainedCheckSettings(session_ttl_seconds=ttl, download_chunk_bytes=1024),
         clock=clock,
     )
+
+
+def client_result(
+    byte_count: int,
+    *,
+    duration_seconds: int = 10,
+    interval_byte_count: int | None = None,
+) -> dict:
+    total_interval_bytes = (
+        byte_count if interval_byte_count is None else interval_byte_count
+    )
+    base, remainder = divmod(total_interval_bytes, duration_seconds)
+    intervals = [
+        {
+            "bytes_transferred": base + (1 if index < remainder else 0),
+            "duration_seconds": 1.0,
+        }
+        for index in range(duration_seconds)
+    ]
+    return {
+        "bytes_transferred": byte_count,
+        "actual_duration_seconds": float(duration_seconds),
+        "intervals": intervals,
+    }
+
+
+def complete_measured_session(
+    manager: SustainedCheckManager,
+    clock: FakeClock,
+    *,
+    direction: str,
+    byte_count: int,
+):
+    session = manager.start_session(
+        client_ip="10.0.0.10",
+        direction=direction,
+        duration_seconds=10,
+        stream_count=1,
+    )
+    manager.begin_phase(session.session_id, session.client_ip, direction, "warmup")
+    clock.advance(3.1)
+    manager.begin_phase(session.session_id, session.client_ip, direction, "measure")
+    manager.record_bytes(session.session_id, session.client_ip, direction, byte_count)
+    clock.advance(10.1)
+    return session
 
 
 def sample_excel_result(*, status: str = "success", error: str = "") -> dict:
@@ -215,7 +262,10 @@ def test_manager_excludes_warmup_and_persists_result(tmp_path):
     result = manager.complete(
         session.session_id,
         session.client_ip,
-        {"latency_samples_ms": [2.0, 3.0, 4.0]},
+        {
+            "latency_samples_ms": [2.0, 3.0, 4.0],
+            "results": {"upload": client_result(3_000_000)},
+        },
     )
 
     assert result["directions"]["upload"]["bytes_transferred"] == 3_000_000
@@ -228,6 +278,142 @@ def test_manager_excludes_warmup_and_persists_result(tmp_path):
         rows = list(csv.DictReader(handle))
     assert rows[0]["bytes_transferred"] == "3000000"
     assert rows[0]["direction"] == "upload"
+
+
+@pytest.mark.parametrize(
+    ("results", "expected_error"),
+    [
+        ({}, "브라우저 측 전송 결과가 없습니다"),
+        (
+            {"upload": client_result(0)},
+            "브라우저 측 전송량이 없어",
+        ),
+        (
+            {
+                "upload": {
+                    **client_result(3_000_000),
+                    "actual_duration_seconds": 0,
+                }
+            },
+            "브라우저 측 측정 시간이 올바르지 않습니다",
+        ),
+    ],
+)
+def test_success_requires_present_positive_client_result(
+    tmp_path,
+    results,
+    expected_error,
+):
+    clock = FakeClock()
+    gate = NetworkMeasurementGate()
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        settings=SustainedCheckSettings(download_chunk_bytes=1024),
+        measurement_gate=gate,
+        clock=clock,
+    )
+    session = complete_measured_session(
+        manager,
+        clock,
+        direction="upload",
+        byte_count=3_000_000,
+    )
+
+    result = manager.complete(
+        session.session_id,
+        session.client_ip,
+        {"results": results},
+    )
+
+    assert result["status"] == "failure"
+    assert expected_error in result["error"]
+    assert result["directions"]["upload"]["bytes_transferred"] == 3_000_000
+    assert manager.active_session is None
+    assert gate.is_available() is True
+    saved = json.loads(
+        (manager.results_root / f"{session.session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved["status"] == "failure"
+    assert expected_error in saved["error"]
+
+
+def test_success_rejects_interval_sum_mismatch_and_preserves_failure(tmp_path):
+    clock = FakeClock()
+    manager = create_manager(tmp_path, clock)
+    session = complete_measured_session(
+        manager,
+        clock,
+        direction="download",
+        byte_count=3_000_000,
+    )
+
+    result = manager.complete(
+        session.session_id,
+        session.client_ip,
+        {
+            "results": {
+                "download": client_result(
+                    3_000_000,
+                    interval_byte_count=2_000_000,
+                )
+            }
+        },
+    )
+
+    assert result["status"] == "failure"
+    assert "전체 전송량과 구간 전송량 합계" in result["error"]
+    assert result["directions"]["download"]["bytes_transferred"] == 3_000_000
+
+
+def test_success_rejects_client_and_server_byte_mismatch(tmp_path):
+    clock = FakeClock()
+    manager = create_manager(tmp_path, clock)
+    session = complete_measured_session(
+        manager,
+        clock,
+        direction="download",
+        byte_count=3_000_000,
+    )
+
+    result = manager.complete(
+        session.session_id,
+        session.client_ip,
+        {"results": {"download": client_result(1_000_000)}},
+    )
+
+    assert result["status"] == "failure"
+    assert "브라우저 측 전송량과 서버 측 전송량 차이" in result["error"]
+    assert result["directions"]["download"]["bytes_transferred"] == 3_000_000
+
+
+def test_success_allows_small_last_chunk_accounting_difference(tmp_path):
+    clock = FakeClock()
+    manager = create_manager(tmp_path, clock)
+    session = complete_measured_session(
+        manager,
+        clock,
+        direction="upload",
+        byte_count=200_000_000,
+    )
+
+    result = manager.complete(
+        session.session_id,
+        session.client_ip,
+        {
+            "results": {
+                "upload": client_result(
+                    193_000_000,
+                    interval_byte_count=187_000_000,
+                )
+            }
+        },
+    )
+
+    assert result["status"] == "success"
+    assert result["directions"]["upload"]["bytes_transferred"] == 200_000_000
 
 
 def test_manager_csv_partial_write_failure_rolls_back_log_and_json(tmp_path, monkeypatch):
@@ -256,13 +442,390 @@ def test_manager_csv_partial_write_failure_rolls_back_log_and_json(tmp_path, mon
 
     monkeypatch.setattr(csv.DictWriter, "writerow", fail_second_writerow)
 
-    with pytest.raises(OSError, match="disk full"):
+    with pytest.raises(SustainedCheckError, match="RESULT_WRITE_FAILED"):
         manager.cancel(session.session_id, session.client_ip)
 
     assert manager.log_path.read_bytes() == original_log
     assert not (manager.results_root / f"{session.session_id}.json").exists()
     assert manager.active_session is None
     assert gate.is_available() is True
+    assert manager.diagnostic_status()["failure_count"] == 1
+    assert manager.diagnostic_status()["last_error_type"] == "OSError"
+
+
+def test_manager_close_records_active_session_failure_and_is_idempotent(tmp_path):
+    gate = NetworkMeasurementGate()
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        measurement_gate=gate,
+    )
+    session = manager.start_session(
+        client_ip="10.0.0.10",
+        direction="upload",
+        duration_seconds=10,
+        stream_count=1,
+    )
+
+    result = manager.close("테스트 종료로 측정이 중단되었습니다.")
+
+    assert result is not None
+    assert result["status"] == "failure"
+    assert result["error"] == "테스트 종료로 측정이 중단되었습니다."
+    assert manager.active_session is None
+    assert gate.is_available() is True
+    saved = json.loads(
+        (manager.results_root / f"{session.session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved["status"] == "failure"
+    assert manager.close() is None
+
+
+def test_expired_session_callback_cannot_close_replacement_session(tmp_path):
+    gate = NetworkMeasurementGate()
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        measurement_gate=gate,
+    )
+    first = manager.start_session(
+        client_ip="10.0.0.10",
+        direction="upload",
+        duration_seconds=10,
+        stream_count=1,
+    )
+    stale_callback = gate._cancel_callback
+    assert stale_callback is not None
+    manager.cancel(first.session_id, first.client_ip)
+    replacement = manager.start_session(
+        client_ip="10.0.0.11",
+        direction="download",
+        duration_seconds=10,
+        stream_count=1,
+    )
+
+    stale_callback()
+
+    assert manager.active_session is replacement
+    assert gate.current_owner().owner_id == replacement.session_id
+    manager.cancel(replacement.session_id, replacement.client_ip)
+
+
+def test_manager_close_releases_gate_even_when_persistence_fails(
+    tmp_path,
+    monkeypatch,
+):
+    gate = NetworkMeasurementGate()
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        measurement_gate=gate,
+    )
+    manager.start_session(
+        client_ip="10.0.0.10",
+        direction="upload",
+        duration_seconds=10,
+        stream_count=1,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_persist_result",
+        lambda result: (_ for _ in ()).throw(OSError("disk failure")),
+    )
+
+    with pytest.raises(SustainedCheckError, match="RESULT_WRITE_FAILED"):
+        manager.close()
+
+    assert manager.active_session is None
+    assert gate.is_available() is True
+    assert manager.diagnostic_status()["failure_count"] == 1
+
+
+def test_manager_archive_failure_keeps_primary_result_and_records_safe_event(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    clock = FakeClock()
+    logger = logging.getLogger("test.sustained.archive")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        settings=SustainedCheckSettings(download_chunk_bytes=1024),
+        clock=clock,
+        diagnostic_logger=logger,
+    )
+    session = complete_measured_session(
+        manager,
+        clock,
+        direction="upload",
+        byte_count=3_000_000,
+    )
+
+    def fail_archive(*_args, **_kwargs):
+        raise OSError("sensitive archive path")
+
+    monkeypatch.setattr(
+        "network_sustained.archive_csv_history",
+        fail_archive,
+    )
+
+    result = manager.complete(
+        session.session_id,
+        session.client_ip,
+        {"results": {"upload": client_result(3_000_000)}},
+    )
+
+    assert result["status"] == "success"
+    assert (
+        manager.results_root / f"{session.session_id}.json"
+    ).exists()
+    assert manager.diagnostic_status() == {
+        "failure_count": 1,
+        "last_event": "http_sustained_csv_archive_failed",
+        "last_error_type": "OSError",
+    }
+    assert "sensitive archive path" not in caplog.text
+
+
+def test_manager_marker_cleanup_failure_keeps_result_and_skips_archive(
+    tmp_path,
+    monkeypatch,
+):
+    clock = FakeClock()
+    gate = NetworkMeasurementGate()
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        clock=clock,
+        measurement_gate=gate,
+    )
+    session = complete_measured_session(
+        manager,
+        clock,
+        direction="upload",
+        byte_count=3_000_000,
+    )
+    monkeypatch.setattr(
+        transaction_module,
+        "_finish_measurement_transaction",
+        lambda _transaction: False,
+    )
+    monkeypatch.setattr(
+        "network_sustained.archive_csv_history",
+        lambda *_args, **_kwargs: pytest.fail("archive must be skipped"),
+    )
+
+    result = manager.complete(
+        session.session_id,
+        session.client_ip,
+        {"results": {"upload": client_result(3_000_000)}},
+    )
+
+    assert result["status"] == "success"
+    assert (manager.results_root / f"{session.session_id}.json").exists()
+    assert manager.diagnostic_status() == {
+        "failure_count": 1,
+        "last_event": "http_sustained_transaction_cleanup_failed",
+        "last_error_type": "OSError",
+    }
+
+    monkeypatch.setattr(
+        gate,
+        "acquire",
+        lambda *_args, **_kwargs: pytest.fail("gate must not be acquired"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_start_expiry_watchdog",
+        lambda *_args, **_kwargs: pytest.fail("watchdog must not start"),
+    )
+    with pytest.raises(SustainedCheckError) as raised:
+        manager.start_session(
+            client_ip="10.0.0.10",
+            direction="upload",
+            duration_seconds=10,
+            stream_count=1,
+        )
+    assert raised.value.status_code == 503
+    assert "MEASUREMENT_RECOVERY_PENDING" in str(raised.value)
+    assert manager.active_session is None
+    assert gate.status()["active"] is False
+    assert len(
+        transaction_module.load_measurement_transactions(
+            transaction_module.measurement_transaction_root_for_log(
+                manager.log_path
+            )
+        )
+    ) == 1
+
+
+def test_manager_preserves_pending_recovery_error_if_marker_appears_before_save(
+    tmp_path,
+    monkeypatch,
+):
+    clock = FakeClock()
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        clock=clock,
+    )
+    pending_checks = iter((False, True))
+    monkeypatch.setattr(
+        "network_sustained.has_pending_measurement_transactions",
+        lambda *_args, **_kwargs: next(pending_checks),
+    )
+    session = complete_measured_session(
+        manager,
+        clock,
+        direction="upload",
+        byte_count=3_000_000,
+    )
+
+    with pytest.raises(SustainedCheckError) as raised:
+        manager.complete(
+            session.session_id,
+            session.client_ip,
+            {"results": {"upload": client_result(3_000_000)}},
+        )
+
+    assert raised.value.status_code == 503
+    assert "MEASUREMENT_RECOVERY_PENDING" in str(raised.value)
+    assert "RESULT_WRITE_FAILED" not in str(raised.value)
+    assert manager.active_session is None
+
+
+def test_expiry_watchdog_records_unexpected_cleanup_failure_without_raw_detail(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    clock = FakeClock()
+    logger = logging.getLogger("test.sustained.expiry")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        settings=SustainedCheckSettings(
+            session_ttl_seconds=0.02,
+            download_chunk_bytes=1024,
+        ),
+        clock=clock,
+        diagnostic_logger=logger,
+    )
+    original_cleanup = manager.cleanup_expired
+    cleanup_calls = 0
+
+    def fail_background_cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            return original_cleanup()
+        raise RuntimeError("sensitive expiry detail")
+
+    monkeypatch.setattr(manager, "cleanup_expired", fail_background_cleanup)
+    session = manager.start_session(
+        client_ip="10.0.0.10",
+        direction="upload",
+        duration_seconds=10,
+        stream_count=1,
+    )
+    clock.advance(0.03)
+
+    deadline = time.perf_counter() + 1.0
+    while manager.diagnostic_status()["failure_count"] == 0:
+        assert time.perf_counter() < deadline
+        time.sleep(0.01)
+
+    assert manager.active_session is session
+    assert manager.diagnostic_status()["last_event"] == (
+        "http_sustained_expiry_cleanup_failed"
+    )
+    assert manager.diagnostic_status()["last_error_type"] == "RuntimeError"
+    assert "sensitive expiry detail" not in caplog.text
+    manager.close("테스트 정리")
+
+
+def test_gate_max_hold_cancels_and_records_stuck_sustained_session(tmp_path):
+    clock = FakeClock()
+    gate = NetworkMeasurementGate(
+        clock=clock,
+        max_hold_seconds={"http_sustained": 5.0},
+    )
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        settings=SustainedCheckSettings(
+            session_ttl_seconds=300,
+            download_chunk_bytes=1024,
+        ),
+        measurement_gate=gate,
+        clock=clock,
+    )
+    session = manager.start_session(
+        client_ip="10.0.0.10",
+        direction="upload",
+        duration_seconds=10,
+        stream_count=1,
+    )
+
+    clock.advance(6)
+    status = gate.status()
+
+    assert status["active"] is False
+    assert status["expired_count"] == 1
+    assert manager.active_session is None
+    saved = json.loads(
+        (manager.results_root / f"{session.session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved["status"] == "failure"
+    assert "최대 실행 시간" in saved["error"]
+
+
+def test_gate_reports_sustained_max_hold_result_persistence_failure(
+    tmp_path,
+    monkeypatch,
+):
+    clock = FakeClock()
+    gate = NetworkMeasurementGate(
+        clock=clock,
+        max_hold_seconds={"http_sustained": 5.0},
+    )
+    manager = SustainedCheckManager(
+        log_path=tmp_path / "data" / "network_check_session_log.csv",
+        results_root=tmp_path / "data" / "network_check_results",
+        settings=SustainedCheckSettings(
+            session_ttl_seconds=300,
+            download_chunk_bytes=1024,
+        ),
+        measurement_gate=gate,
+        clock=clock,
+    )
+    manager.start_session(
+        client_ip="10.0.0.10",
+        direction="upload",
+        duration_seconds=10,
+        stream_count=1,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_persist_result",
+        lambda result: (_ for _ in ()).throw(OSError("disk failure")),
+    )
+
+    clock.advance(6)
+    status = gate.status()
+
+    assert status["active"] is False
+    assert status["expired_count"] == 1
+    assert status["cancel_callback_failure_count"] == 1
+    assert manager.active_session is None
+    assert list(manager.results_root.glob("*.json")) == []
 
 
 def test_manager_rejects_parallel_session_and_wrong_ip(tmp_path):
@@ -351,6 +914,8 @@ def test_sustained_routes_validate_and_cancel(sustained_client):
         json={"direction": "upload", "duration_seconds": 5, "stream_count": 1},
     )
     assert invalid.status_code == 400
+    assert "no-store" in invalid.headers["Cache-Control"]
+    assert invalid.headers["X-Content-Type-Options"] == "nosniff"
 
     parallel = client.post(
         "/network-check/sustained/sessions",
@@ -431,10 +996,130 @@ def test_sustained_result_download_is_limited_to_origin_ip(sustained_client):
     assert excel_allowed.status_code == 200
     assert excel_allowed.mimetype == EXCEL_MIME_TYPE
     assert "no-store" in excel_allowed.headers["Cache-Control"]
-    assert "202607" in excel_allowed.headers["Content-Disposition"]
+    expected_timestamp = build_sustained_excel_filename(allowed.json).removeprefix(
+        "HTTP_시간측정_"
+    ).removesuffix(".xlsx")
+    assert expected_timestamp in excel_allowed.headers["Content-Disposition"]
     assert session_id[:8] not in excel_allowed.headers["Content-Disposition"]
     assert load_workbook(BytesIO(excel_allowed.data)).sheetnames == ["결과 요약", "속도 변화"]
     assert excel_denied.status_code == 403
+
+
+def test_sustained_json_download_reads_authorized_result_once(
+    sustained_client,
+    monkeypatch,
+):
+    client, tmp_path = sustained_client
+    started = client.post(
+        "/network-check/sustained/sessions",
+        json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+    session_id = started.json["session_id"]
+    client.post(
+        f"/network-check/sustained/sessions/{session_id}/cancel",
+        json={},
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+    result_path = tmp_path / "data" / "network_check_results" / f"{session_id}.json"
+    expected_text = result_path.read_text(encoding="utf-8")
+    original_read_text = Path.read_text
+    result_read_count = 0
+
+    def counted_read_text(path: Path, *args, **kwargs):
+        nonlocal result_read_count
+        if path == result_path:
+            result_read_count += 1
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+
+    response = client.get(
+        f"/network-check/sustained/results/{session_id}.json",
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_data(as_text=True) == expected_text
+    assert result_read_count == 1
+    missing = client.get(
+        f"/network-check/sustained/results/{'f' * 32}.json",
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+    assert missing.status_code == 404
+    assert missing.is_json
+
+
+def test_sustained_json_download_returns_safe_error_when_result_read_fails(
+    sustained_client,
+    monkeypatch,
+):
+    client, tmp_path = sustained_client
+    started = client.post(
+        "/network-check/sustained/sessions",
+        json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+    session_id = started.json["session_id"]
+    client.post(
+        f"/network-check/sustained/sessions/{session_id}/cancel",
+        json={},
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+    result_path = tmp_path / "data" / "network_check_results" / f"{session_id}.json"
+    original_read_text = Path.read_text
+
+    def deleting_read_text(path: Path, *args, **kwargs):
+        if path == result_path:
+            path.unlink()
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deleting_read_text)
+
+    response = client.get(
+        f"/network-check/sustained/results/{session_id}.json",
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+
+    assert response.status_code == 500
+    assert response.is_json
+    assert "RESULT_READ_FAILED" in response.json["error"]
+    assert "FileNotFoundError" not in response.json["error"]
+    assert str(result_path) not in response.json["error"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_sustained_json_download_returns_safe_error_for_invalid_utf8(
+    sustained_client,
+):
+    client, tmp_path = sustained_client
+    started = client.post(
+        "/network-check/sustained/sessions",
+        json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+    session_id = started.json["session_id"]
+    client.post(
+        f"/network-check/sustained/sessions/{session_id}/cancel",
+        json={},
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+    result_path = tmp_path / "data" / "network_check_results" / f"{session_id}.json"
+    result_path.write_bytes(b"\xff\xfe\x00")
+
+    response = client.get(
+        f"/network-check/sustained/results/{session_id}.json",
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
+    )
+
+    assert response.status_code == 500
+    assert response.is_json
+    assert "RESULT_READ_FAILED" in response.json["error"]
+    assert "UnicodeDecodeError" not in response.json["error"]
+    assert str(result_path) not in response.json["error"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
 
 
 def test_sustained_excel_download_handles_missing_and_corrupt_results(sustained_client):

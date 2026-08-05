@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import csv
 import json
-import os
+import logging
+import math
 import secrets
 import socket
-import sys
+import statistics
 import threading
 import time
 import uuid
@@ -14,8 +15,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app_version import APP_VERSION
+from measurement_transactions import (
+    commit_measurement_result,
+    has_pending_measurement_transactions,
+    measurement_transaction_root_for_log,
+)
 from network_measurement import NetworkMeasurementGate
-from result_storage import prune_old_json_results, write_json_atomically
+from result_storage import prune_old_json_results
 from runtime_stability import CsvIntegrityError, archive_csv_history
 
 from .models import (
@@ -65,6 +71,60 @@ PROBE_LOG_FIELDS = [
 ]
 TERMINAL_STATUSES = {"completed", "cancelled", "failed"}
 RESULT_SUBMISSION_TIMEOUT_SECONDS = 15.0
+PROBE_MAX_REGISTERED_AGENTS = 256
+PROBE_MAX_RESULT_BYTES = 4 * 1024**4
+PROBE_MAX_RESULT_MBPS = 10_000_000.0
+PROBE_STREAM_DURATION_EARLY_TOLERANCE_SECONDS = 1.0
+PROBE_MAX_TELEMETRY_VALUE = (1 << 63) - 1
+PROBE_MAX_TELEMETRY_ERROR_CHARS = 500
+PROBE_RESULT_FIELDS = frozenset(
+    {
+        "role",
+        "bytes",
+        "duration_seconds",
+        "average_mbps",
+        "median_mbps",
+        "min_mbps",
+        "max_mbps",
+        "intervals",
+        "streams",
+        "telemetry",
+    }
+)
+PROBE_STREAM_RESULT_FIELDS = frozenset(
+    {
+        "stream_id",
+        "role",
+        "bytes",
+        "duration_seconds",
+        "mbps",
+        "interval_bytes",
+        "telemetry",
+    }
+)
+PROBE_INTERVAL_FIELDS = frozenset({"index", "bytes", "mbps"})
+PROBE_TELEMETRY_FIELDS = frozenset(
+    {
+        "available",
+        "error",
+        "rtt_us",
+        "min_rtt_us",
+        "cwnd_bytes",
+        "bytes_retrans",
+        "fast_retransmits",
+        "duplicate_acks",
+        "timeout_episodes",
+    }
+)
+PROBE_TELEMETRY_COUNTER_FIELDS = (
+    "rtt_us",
+    "min_rtt_us",
+    "cwnd_bytes",
+    "bytes_retrans",
+    "fast_retransmits",
+    "duplicate_acks",
+    "timeout_episodes",
+)
 CONNECTIVITY_FAILURE_MESSAGES = {
     "connect_timeout": "TCP 측정 포트 연결 시간이 초과되었습니다.",
     "connection_refused": "TCP 측정 포트에서 연결을 거부했습니다.",
@@ -90,6 +150,75 @@ def ensure_probe_storage(log_path: Path, results_root: Path) -> None:
         csv.DictWriter(handle, fieldnames=PROBE_LOG_FIELDS).writeheader()
 
 
+def _microseconds_to_milliseconds(value: Any) -> str | float:
+    try:
+        return round(float(value) / 1000, 3)
+    except (TypeError, ValueError):
+        return ""
+
+
+def build_probe_log_rows(
+    result: dict[str, Any],
+) -> list[dict[str, object]]:
+    requested = result["requested"]
+    direction = requested["direction"]
+    phases = (
+        ("upload", "download")
+        if direction == "full"
+        else (direction,)
+    )
+    agent = result["agent"]
+    result_json = (
+        "data/network_probe_results/"
+        f"{result['session_id']}.json"
+    )
+    rows: list[dict[str, object]] = []
+    for phase in phases:
+        combined = result["phases"].get(phase, {})
+        sender = combined.get("sender", {})
+        receiver = combined.get("receiver", {})
+        telemetry = sender.get("telemetry", {})
+        rows.append(
+            {
+                "checked_at": result["completed_at"],
+                "session_id": result["session_id"],
+                "agent_id": agent["agent_id"],
+                "agent_hostname": agent["hostname"],
+                "client_ip": agent["client_ip"],
+                "server_host": result["server_host"],
+                "requested_direction": direction,
+                "phase": phase,
+                "duration_seconds": requested["duration_seconds"],
+                "warmup_seconds": requested["warmup_seconds"],
+                "stream_count": requested["stream_count"],
+                "sender_bytes": sender.get("bytes", ""),
+                "receiver_bytes": receiver.get("bytes", ""),
+                "sender_mbps": sender.get("average_mbps", ""),
+                "receiver_mbps": receiver.get("average_mbps", ""),
+                "median_rtt_ms": _microseconds_to_milliseconds(
+                    telemetry.get("rtt_us")
+                ),
+                "min_rtt_ms": _microseconds_to_milliseconds(
+                    telemetry.get("min_rtt_us")
+                ),
+                "cwnd_bytes": (
+                    telemetry.get("cwnd_bytes", "")
+                    if telemetry.get("available")
+                    else ""
+                ),
+                "retransmitted_bytes": (
+                    telemetry.get("bytes_retrans", "")
+                    if telemetry.get("available")
+                    else ""
+                ),
+                "status": result["status"],
+                "error": result["error"],
+                "result_json": result_json,
+            }
+        )
+    return rows
+
+
 class ProbeService:
     def __init__(
         self,
@@ -98,11 +227,13 @@ class ProbeService:
         measurement_gate: NetworkMeasurementGate,
         normalize_ip: Callable[[str | None], str],
         clock: Callable[[], float] = time.perf_counter,
+        diagnostic_logger: logging.Logger | None = None,
     ) -> None:
         self.config = config
         self.measurement_gate = measurement_gate
         self.normalize_ip = normalize_ip
         self.clock = clock
+        self.diagnostic_logger = diagnostic_logger or logging.getLogger(__name__)
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.storage_lock = threading.Lock()
@@ -118,7 +249,40 @@ class ProbeService:
         self.stop_event = threading.Event()
         self.start_error = ""
         self.started = False
+        self.diagnostic_failure_count = 0
+        self.last_diagnostic_event = ""
+        self.last_diagnostic_error_type = ""
         ensure_probe_storage(config.log_path, config.results_root)
+
+    def set_diagnostic_logger(self, logger: logging.Logger) -> None:
+        self.diagnostic_logger = logger
+
+    def _record_diagnostic_failure(
+        self,
+        event: str,
+        exc: BaseException,
+        *,
+        warning: bool = False,
+    ) -> None:
+        error_type = type(exc).__name__
+        with self.lock:
+            self.diagnostic_failure_count += 1
+            self.last_diagnostic_event = event
+            self.last_diagnostic_error_type = error_type
+        log_method = (
+            self.diagnostic_logger.warning
+            if warning
+            else self.diagnostic_logger.error
+        )
+        log_method("%s error_type=%s", event, error_type)
+
+    def diagnostic_status(self) -> dict[str, str | int]:
+        with self.lock:
+            return {
+                "failure_count": self.diagnostic_failure_count,
+                "last_event": self.last_diagnostic_event,
+                "last_error_type": self.last_diagnostic_error_type,
+            }
 
     def start(self) -> bool:
         if not self.config.enabled:
@@ -134,7 +298,12 @@ class ProbeService:
                 listener.settimeout(1.0)
             except OSError as exc:
                 listener.close()
-                self.start_error = f"TCP {self.config.port} 포트를 열 수 없습니다: {exc}"
+                self._record_diagnostic_failure("tcp_listener_bind_failed", exc)
+                self.start_error = (
+                    f"TCP {self.config.port} 포트를 열 수 없습니다. 오류 코드: "
+                    "TCP_BIND_FAILED. 다른 프로그램의 포트 사용 여부와 방화벽 "
+                    "정책을 확인하세요."
+                )
                 return False
             self.listener = listener
             self.stop_event.clear()
@@ -213,7 +382,13 @@ class ProbeService:
         now = self.clock()
         token = secrets.token_urlsafe(32)
         with self.condition:
+            self._cleanup_expired_agents_locked()
             previous = self.agents.get(agent_id)
+            if previous is None and len(self.agents) >= PROBE_MAX_REGISTERED_AGENTS:
+                raise ProbeServiceError(
+                    "등록 가능한 TCP 측정 클라이언트 수를 초과했습니다. 잠시 후 다시 시도하세요.",
+                    429,
+                )
             if previous and previous.busy_session_id:
                 raise ProbeServiceError("측정 중인 에이전트는 다시 등록할 수 없습니다.", 409)
             self.agents[agent_id] = AgentRecord(
@@ -311,6 +486,18 @@ class ProbeService:
                     return {"job": None}
                 self.condition.wait(timeout=min(remaining, 1.0))
 
+    def _raise_if_measurement_recovery_pending_locked(self) -> None:
+        if has_pending_measurement_transactions(
+            measurement_transaction_root_for_log(self.config.log_path),
+            "tcp_probe",
+        ):
+            raise ProbeServiceError(
+                "이전 TCP 측정 결과 복구가 필요합니다. 오류 코드: "
+                "MEASUREMENT_RECOVERY_PENDING. 서버를 다시 시작한 뒤 "
+                "재측정하세요.",
+                503,
+            )
+
     def create_session(
         self,
         *,
@@ -330,10 +517,21 @@ class ProbeService:
         if stream_count not in PROBE_STREAM_COUNTS:
             raise ProbeServiceError("TCP 스트림 수는 1개 또는 4개만 선택할 수 있습니다.")
 
+        with self.storage_lock:
+            self._raise_if_measurement_recovery_pending_locked()
         session_id = uuid.uuid4().hex
-        if not self.measurement_gate.acquire("tcp_probe", session_id):
+        if not self.measurement_gate.acquire(
+            "tcp_probe",
+            session_id,
+            cancel_callback=lambda: self.cancel_session(
+                session_id,
+                error="최대 실행 시간을 초과하여 TCP 측정이 중단되었습니다.",
+            ),
+        ):
             raise ProbeServiceError("다른 네트워크 측정이 진행 중입니다.", 409)
         try:
+            with self.storage_lock:
+                self._raise_if_measurement_recovery_pending_locked()
             with self.condition:
                 self._cleanup_terminal_sessions_locked()
                 self._cleanup_expired_agents_locked()
@@ -461,16 +659,29 @@ class ProbeService:
         self.authenticate_agent(agent_id, token, client_ip)
         phase = str(payload.get("phase", ""))
         requested_status = str(payload.get("status", "success"))
+        with self.lock:
+            session = self._require_agent_session_locked(session_id, agent_id)
         if requested_status != "success":
-            with self.lock:
-                session = self._require_agent_session_locked(session_id, agent_id)
             self._finalize_session(session, "failed", str(payload.get("error", "TCP 클라이언트 측정에 실패했습니다."))[:500])
             return self.session_status(session_id)
+        if phase != session.next_phase():
+            raise ProbeServiceError("TCP 측정 단계 순서가 올바르지 않습니다.", 409)
 
-        result = self._validated_side_result(payload.get("result"), phase)
+        try:
+            result = self._validated_side_result(
+                payload.get("result"),
+                phase,
+                expected_duration_seconds=session.duration_seconds,
+                expected_stream_count=session.stream_count,
+            )
+        except ProbeServiceError as exc:
+            self._finalize_session(session, "failed", str(exc))
+            return self.session_status(session_id)
         deadline = self.clock() + 15.0
         with self.condition:
             session = self._require_agent_session_locked(session_id, agent_id)
+            if session.status in TERMINAL_STATUSES:
+                return self.session_status(session_id)
             if phase != session.next_phase():
                 raise ProbeServiceError("TCP 측정 단계 순서가 올바르지 않습니다.", 409)
             streams = result.get("streams")
@@ -514,15 +725,27 @@ class ProbeService:
             raise ProbeServiceError("TCP 측정 결과를 찾을 수 없습니다.", 404)
         return path
 
-    def saved_result_for(self, session_id: str) -> dict[str, Any]:
+    def _read_result_payload(self, session_id: str) -> tuple[str, dict[str, Any]]:
         path = self.result_path_for(session_id)
         try:
-            saved = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ProbeServiceError("TCP 측정 결과 파일을 읽을 수 없습니다.", 500) from exc
+            result_text = path.read_text(encoding="utf-8")
+            saved = json.loads(result_text)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ProbeServiceError(
+                "TCP 측정 결과 파일을 읽을 수 없습니다. 오류 코드: RESULT_READ_FAILED.",
+                500,
+            ) from exc
         if not isinstance(saved, dict):
             raise ProbeServiceError("TCP 측정 결과 파일 형식이 올바르지 않습니다.", 500)
+        return result_text, saved
+
+    def saved_result_for(self, session_id: str) -> dict[str, Any]:
+        _, saved = self._read_result_payload(session_id)
         return saved
+
+    def result_text_for(self, session_id: str) -> str:
+        result_text, _ = self._read_result_payload(session_id)
+        return result_text
 
     def _accept_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -846,33 +1069,51 @@ class ProbeService:
                 if agent and agent.busy_session_id == session.session_id:
                     agent.busy_session_id = ""
                     agent.pending_job = None
-                self.measurement_gate.release("tcp_probe", session.session_id)
                 sockets = [sock for values in session.sockets.values() for sock in values.values()]
                 session.sockets.clear()
                 self.condition.notify_all()
                 should_persist = True
-        for sock in sockets:
-            self._close_socket(sock)
-        if should_persist:
-            try:
-                self._persist_result(session)
-            except Exception as exc:
-                with self.condition:
-                    session.status = "failed"
-                    session.error = f"TCP 측정 결과 저장 실패: {exc}"[:500]
-                    session.result_available = False
-                    session.persistence_complete = True
-                    session.completed_at_monotonic = self.clock()
-                    self._cleanup_terminal_sessions_locked(preserve_session_id=session.session_id)
-                    self.condition.notify_all()
-                print(session.error, file=sys.stderr)
-            else:
-                with self.condition:
-                    session.result_available = True
-                    session.persistence_complete = True
-                    session.completed_at_monotonic = self.clock()
-                    self._cleanup_terminal_sessions_locked(preserve_session_id=session.session_id)
-                    self.condition.notify_all()
+        try:
+            for sock in sockets:
+                self._close_socket(sock)
+            if should_persist:
+                try:
+                    self._persist_result(session)
+                except Exception as exc:
+                    self._record_diagnostic_failure(
+                        "tcp_result_persistence_failed",
+                        exc,
+                    )
+                    with self.condition:
+                        session.status = "failed"
+                        session.error = (
+                            str(exc)
+                            if isinstance(exc, ProbeServiceError)
+                            else (
+                                "TCP 측정 결과 저장 실패. 오류 코드: "
+                                "RESULT_WRITE_FAILED. 서버 진단 로그를 확인한 뒤 다시 "
+                                "측정하세요."
+                            )
+                        )
+                        session.result_available = False
+                        session.persistence_complete = True
+                        session.completed_at_monotonic = self.clock()
+                        self._cleanup_terminal_sessions_locked(
+                            preserve_session_id=session.session_id
+                        )
+                        self.condition.notify_all()
+                else:
+                    with self.condition:
+                        session.result_available = True
+                        session.persistence_complete = True
+                        session.completed_at_monotonic = self.clock()
+                        self._cleanup_terminal_sessions_locked(
+                            preserve_session_id=session.session_id
+                        )
+                        self.condition.notify_all()
+        finally:
+            if should_persist:
+                self.measurement_gate.release("tcp_probe", session.session_id)
 
     def _persist_result(self, session: ProbeSession) -> None:
         completed_at = self._timestamp()
@@ -899,79 +1140,313 @@ class ProbeService:
         }
         ensure_probe_storage(self.config.log_path, self.config.results_root)
         path = self.config.results_root / f"{session.session_id}.json"
-        relative_path = f"data/network_probe_results/{path.name}"
+        rows = build_probe_log_rows(result)
         with self.storage_lock:
-            original_log_size = self.config.log_path.stat().st_size
-            write_json_atomically(path, result)
-            try:
-                with self.config.log_path.open("a", encoding="utf-8", newline="") as handle:
-                    writer = csv.DictWriter(handle, fieldnames=PROBE_LOG_FIELDS)
-                    phases = session.phases()
-                    for phase in phases:
-                        combined = session.combined_results.get(phase, {})
-                        sender = combined.get("sender", {})
-                        receiver = combined.get("receiver", {})
-                        telemetry = sender.get("telemetry", {})
-                        writer.writerow(
-                            {
-                                "checked_at": completed_at,
-                                "session_id": session.session_id,
-                                "agent_id": session.agent_id,
-                                "agent_hostname": session.agent_hostname,
-                                "client_ip": session.client_ip,
-                                "server_host": session.server_host,
-                                "requested_direction": session.requested_direction,
-                                "phase": phase,
-                                "duration_seconds": session.duration_seconds,
-                                "warmup_seconds": self.config.warmup_seconds,
-                                "stream_count": session.stream_count,
-                                "sender_bytes": sender.get("bytes", ""),
-                                "receiver_bytes": receiver.get("bytes", ""),
-                                "sender_mbps": sender.get("average_mbps", ""),
-                                "receiver_mbps": receiver.get("average_mbps", ""),
-                                "median_rtt_ms": self._microseconds_to_milliseconds(telemetry.get("rtt_us")),
-                                "min_rtt_ms": self._microseconds_to_milliseconds(telemetry.get("min_rtt_us")),
-                                "cwnd_bytes": telemetry.get("cwnd_bytes", "") if telemetry.get("available") else "",
-                                "retransmitted_bytes": telemetry.get("bytes_retrans", "") if telemetry.get("available") else "",
-                                "status": session.status,
-                                "error": session.error,
-                                "result_json": relative_path,
-                            }
-                        )
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except Exception:
-                try:
-                    with self.config.log_path.open("r+b") as handle:
-                        handle.truncate(original_log_size)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                finally:
-                    path.unlink(missing_ok=True)
-                raise
+            self._raise_if_measurement_recovery_pending_locked()
+            marker_removed = commit_measurement_result(
+                source="tcp_probe",
+                result_path=path,
+                result=result,
+                log_path=self.config.log_path,
+                fieldnames=PROBE_LOG_FIELDS,
+                key_field="phase",
+                rows=rows,
+            )
+            if not marker_removed:
+                self._record_diagnostic_failure(
+                    "tcp_measurement_transaction_cleanup_failed",
+                    OSError("measurement transaction cleanup failed"),
+                    warning=True,
+                )
+                return
             try:
                 archive_csv_history(self.config.log_path, PROBE_LOG_FIELDS)
-            except (OSError, CsvIntegrityError):
-                pass
+            except (OSError, CsvIntegrityError) as exc:
+                self._record_diagnostic_failure(
+                    "tcp_csv_archive_failed",
+                    exc,
+                    warning=True,
+                )
             prune_old_json_results(self.config.results_root)
 
-    def _validated_side_result(self, value: Any, phase: str) -> dict[str, Any]:
+    def _validated_side_result(
+        self,
+        value: Any,
+        phase: str,
+        *,
+        expected_duration_seconds: int,
+        expected_stream_count: int,
+    ) -> dict[str, Any]:
         if phase not in {"upload", "download"} or not isinstance(value, dict):
             raise ProbeServiceError("TCP 클라이언트 결과 형식이 올바르지 않습니다.")
+        self._reject_unexpected_result_fields(value, PROBE_RESULT_FIELDS, "결과")
         expected_role = "sender" if phase == "upload" else "receiver"
         if value.get("role") != expected_role:
             raise ProbeServiceError("TCP 클라이언트 결과 역할이 올바르지 않습니다.")
-        try:
-            byte_count = max(0, int(value.get("bytes", 0)))
-            duration = float(value.get("duration_seconds", 0))
-        except (TypeError, ValueError) as exc:
-            raise ProbeServiceError("TCP 클라이언트 처리량 결과가 올바르지 않습니다.") from exc
-        if not 0 < duration <= self.config.warmup_seconds + max(PROBE_DURATIONS) + 5:
+        byte_count = self._bounded_result_int(
+            value.get("bytes"),
+            "전송량",
+            minimum=0,
+            maximum=PROBE_MAX_RESULT_BYTES,
+        )
+        if byte_count <= 0:
+            raise ProbeServiceError("TCP 클라이언트 결과에 전송된 데이터가 없습니다.")
+        duration = self._bounded_result_float(
+            value.get("duration_seconds"),
+            "측정 시간",
+            minimum=0.0,
+            maximum=float(max(PROBE_DURATIONS) + 5),
+        )
+        if (
+            duration <= 0
+            or not math.isclose(
+                duration,
+                float(expected_duration_seconds),
+                rel_tol=0.0,
+                abs_tol=0.001,
+            )
+        ):
             raise ProbeServiceError("TCP 클라이언트 측정 시간이 올바르지 않습니다.")
-        sanitized = dict(value)
-        sanitized["bytes"] = byte_count
-        sanitized["duration_seconds"] = duration
-        sanitized["average_mbps"] = round(byte_count * 8 / duration / 1_000_000, 2)
+
+        metric_fields = ("average_mbps", "median_mbps", "min_mbps", "max_mbps")
+        for field_name in metric_fields:
+            if field_name in value:
+                self._bounded_result_float(
+                    value[field_name],
+                    field_name,
+                    minimum=0.0,
+                    maximum=PROBE_MAX_RESULT_MBPS,
+                )
+
+        raw_intervals = value.get("intervals")
+        if (
+            not isinstance(raw_intervals, list)
+            or len(raw_intervals) != expected_duration_seconds
+        ):
+            raise ProbeServiceError("TCP 클라이언트 구간 결과 수가 올바르지 않습니다.")
+        sanitized_intervals: list[dict[str, Any]] = []
+        interval_total_bytes = 0
+        for offset, interval in enumerate(raw_intervals, start=1):
+            if not isinstance(interval, dict):
+                raise ProbeServiceError("TCP 클라이언트 구간 결과 형식이 올바르지 않습니다.")
+            self._reject_unexpected_result_fields(interval, PROBE_INTERVAL_FIELDS, "구간 결과")
+            interval_index = self._bounded_result_int(
+                interval.get("index"),
+                "구간 번호",
+                minimum=1,
+                maximum=expected_duration_seconds,
+            )
+            if interval_index != offset:
+                raise ProbeServiceError("TCP 클라이언트 구간 번호가 올바르지 않습니다.")
+            interval_bytes = self._bounded_result_int(
+                interval.get("bytes"),
+                "구간 전송량",
+                minimum=0,
+                maximum=PROBE_MAX_RESULT_BYTES,
+            )
+            if "mbps" in interval:
+                self._bounded_result_float(
+                    interval["mbps"],
+                    "구간 처리량",
+                    minimum=0.0,
+                    maximum=PROBE_MAX_RESULT_MBPS,
+                )
+            interval_mbps = round(interval_bytes * 8 / 1_000_000, 2)
+            if interval_mbps > PROBE_MAX_RESULT_MBPS:
+                raise ProbeServiceError("TCP 클라이언트 구간 처리량이 허용 범위를 벗어났습니다.")
+            sanitized_intervals.append(
+                {
+                    "index": interval_index,
+                    "bytes": interval_bytes,
+                    "mbps": interval_mbps,
+                }
+            )
+            interval_total_bytes += interval_bytes
+        if interval_total_bytes != byte_count:
+            raise ProbeServiceError("TCP 클라이언트 구간 전송량 합계가 올바르지 않습니다.")
+
+        streams = value.get("streams")
+        if not isinstance(streams, list) or len(streams) != expected_stream_count:
+            raise ProbeServiceError("TCP 클라이언트 스트림 결과 수가 올바르지 않습니다.")
+        stream_ids: set[int] = set()
+        stream_total_bytes = 0
+        sanitized_streams: list[dict[str, Any]] = []
+        for stream in streams:
+            if not isinstance(stream, dict):
+                raise ProbeServiceError("TCP 클라이언트 스트림 결과 형식이 올바르지 않습니다.")
+            self._reject_unexpected_result_fields(stream, PROBE_STREAM_RESULT_FIELDS, "스트림 결과")
+            if stream.get("role") != expected_role:
+                raise ProbeServiceError("TCP 클라이언트 스트림 결과 역할이 올바르지 않습니다.")
+            stream_id = self._bounded_result_int(
+                stream.get("stream_id"),
+                "스트림 번호",
+                minimum=0,
+                maximum=expected_stream_count - 1,
+            )
+            stream_bytes = self._bounded_result_int(
+                stream.get("bytes"),
+                "스트림 전송량",
+                minimum=0,
+                maximum=PROBE_MAX_RESULT_BYTES,
+            )
+            if stream_bytes <= 0:
+                raise ProbeServiceError("TCP 클라이언트 스트림에 전송된 데이터가 없습니다.")
+            stream_duration = self._bounded_result_float(
+                stream.get("duration_seconds"),
+                "스트림 측정 시간",
+                minimum=0.0,
+                maximum=float(expected_duration_seconds + 5),
+            )
+            if stream_duration <= 0:
+                raise ProbeServiceError("TCP 클라이언트 스트림 측정 시간이 올바르지 않습니다.")
+            if stream_duration < max(
+                float(expected_duration_seconds)
+                - PROBE_STREAM_DURATION_EARLY_TOLERANCE_SECONDS,
+                0.001,
+            ):
+                raise ProbeServiceError(
+                    "TCP 클라이언트 스트림 측정 시간이 요청보다 너무 짧습니다."
+                )
+            if stream_id in stream_ids:
+                raise ProbeServiceError("TCP 클라이언트 스트림 번호가 올바르지 않습니다.")
+            if "mbps" in stream:
+                self._bounded_result_float(
+                    stream["mbps"],
+                    "스트림 처리량",
+                    minimum=0.0,
+                    maximum=PROBE_MAX_RESULT_MBPS,
+                )
+            stream_mbps = round(stream_bytes * 8 / stream_duration / 1_000_000, 2)
+            if stream_mbps > PROBE_MAX_RESULT_MBPS:
+                raise ProbeServiceError("TCP 클라이언트 스트림 처리량이 허용 범위를 벗어났습니다.")
+
+            raw_interval_bytes = stream.get("interval_bytes")
+            if (
+                not isinstance(raw_interval_bytes, list)
+                or len(raw_interval_bytes) != expected_duration_seconds
+            ):
+                raise ProbeServiceError("TCP 클라이언트 스트림 구간 결과 수가 올바르지 않습니다.")
+            sanitized_interval_bytes = [
+                self._bounded_result_int(
+                    interval_bytes,
+                    "스트림 구간 전송량",
+                    minimum=0,
+                    maximum=PROBE_MAX_RESULT_BYTES,
+                )
+                for interval_bytes in raw_interval_bytes
+            ]
+            if sum(sanitized_interval_bytes) != stream_bytes:
+                raise ProbeServiceError("TCP 클라이언트 스트림 구간 전송량 합계가 올바르지 않습니다.")
+
+            stream_telemetry = self._validated_telemetry(stream.get("telemetry"))
+            stream_ids.add(stream_id)
+            stream_total_bytes += stream_bytes
+            sanitized_streams.append(
+                {
+                    "stream_id": stream_id,
+                    "role": expected_role,
+                    "bytes": stream_bytes,
+                    "duration_seconds": stream_duration,
+                    "mbps": stream_mbps,
+                    "interval_bytes": sanitized_interval_bytes,
+                    "telemetry": stream_telemetry,
+                }
+            )
+        if stream_total_bytes != byte_count:
+            raise ProbeServiceError("TCP 클라이언트 스트림 전송량 합계가 올바르지 않습니다.")
+
+        average_mbps = round(byte_count * 8 / duration / 1_000_000, 2)
+        if average_mbps > PROBE_MAX_RESULT_MBPS:
+            raise ProbeServiceError("TCP 클라이언트 처리량이 허용 범위를 벗어났습니다.")
+        interval_speeds = [float(interval["mbps"]) for interval in sanitized_intervals]
+        return {
+            "role": expected_role,
+            "bytes": byte_count,
+            "duration_seconds": duration,
+            "average_mbps": average_mbps,
+            "median_mbps": round(statistics.median(interval_speeds), 2)
+            if interval_speeds
+            else 0.0,
+            "min_mbps": round(min(interval_speeds), 2) if interval_speeds else 0.0,
+            "max_mbps": round(max(interval_speeds), 2) if interval_speeds else 0.0,
+            "intervals": sanitized_intervals,
+            "streams": sorted(sanitized_streams, key=lambda item: item["stream_id"]),
+            "telemetry": self._validated_telemetry(value.get("telemetry")),
+        }
+
+    @staticmethod
+    def _reject_unexpected_result_fields(
+        value: dict[str, Any],
+        allowed_fields: frozenset[str],
+        label: str,
+    ) -> None:
+        if set(value) - allowed_fields:
+            raise ProbeServiceError(f"TCP 클라이언트 {label}에 허용되지 않은 항목이 있습니다.")
+
+    @staticmethod
+    def _bounded_result_int(
+        value: Any,
+        label: str,
+        *,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ProbeServiceError(f"TCP 클라이언트 {label} 값이 올바르지 않습니다.")
+        if value < minimum or value > maximum:
+            raise ProbeServiceError(f"TCP 클라이언트 {label} 값이 허용 범위를 벗어났습니다.")
+        return value
+
+    @staticmethod
+    def _bounded_result_float(
+        value: Any,
+        label: str,
+        *,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ProbeServiceError(f"TCP 클라이언트 {label} 값이 올바르지 않습니다.")
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < minimum or numeric > maximum:
+            raise ProbeServiceError(f"TCP 클라이언트 {label} 값이 허용 범위를 벗어났습니다.")
+        return numeric
+
+    def _validated_telemetry(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ProbeServiceError("TCP 클라이언트 상세 통계 형식이 올바르지 않습니다.")
+        self._reject_unexpected_result_fields(value, PROBE_TELEMETRY_FIELDS, "상세 통계")
+        available = value.get("available")
+        if not isinstance(available, bool):
+            raise ProbeServiceError("TCP 클라이언트 상세 통계 상태가 올바르지 않습니다.")
+
+        if not available:
+            if set(value) - {"available", "error"}:
+                raise ProbeServiceError("사용할 수 없는 TCP 상세 통계에 수치 항목이 포함되어 있습니다.")
+            sanitized: dict[str, Any] = {"available": False}
+            if "error" in value:
+                error = value["error"]
+                if not isinstance(error, str) or len(error) > PROBE_MAX_TELEMETRY_ERROR_CHARS:
+                    raise ProbeServiceError("TCP 클라이언트 상세 통계 오류 설명이 너무 깁니다.")
+                sanitized["error"] = error
+            return sanitized
+
+        if "error" in value:
+            raise ProbeServiceError("사용 가능한 TCP 상세 통계에 오류 설명이 포함되어 있습니다.")
+        sanitized = {"available": True}
+        for field_name in PROBE_TELEMETRY_COUNTER_FIELDS:
+            if field_name not in value:
+                continue
+            counter = value[field_name]
+            if counter is None and field_name in {"rtt_us", "min_rtt_us"}:
+                sanitized[field_name] = None
+                continue
+            sanitized[field_name] = self._bounded_result_int(
+                counter,
+                field_name,
+                minimum=0,
+                maximum=PROBE_MAX_TELEMETRY_VALUE,
+            )
         return sanitized
 
     def _require_session_locked(self, session_id: str) -> ProbeSession:
@@ -1092,10 +1567,7 @@ class ProbeService:
 
     @staticmethod
     def _microseconds_to_milliseconds(value: Any) -> str | float:
-        try:
-            return round(float(value) / 1000, 3)
-        except (TypeError, ValueError):
-            return ""
+        return _microseconds_to_milliseconds(value)
 
     @staticmethod
     def _close_socket(sock: socket.socket) -> None:

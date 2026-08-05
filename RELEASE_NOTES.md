@@ -1,8 +1,42 @@
 # Release Notes 운영 규칙
 
-현재 앱 버전: `v0.4.6`
+현재 앱 버전: `v0.5.0`
 
 이 파일은 저장소에 커밋하는 릴리즈 준비 점검 문서입니다. 현재 GitHub Actions가 Windows 실행 ZIP을 만들고 GitHub Release에 업로드합니다. Release 본문은 이 파일과 `CHANGELOG.md` 기준으로 작성합니다.
+
+## v0.5.0 - 2026-08-05
+
+기존 업로드·다운로드 URL, CSV·JSON·Excel 형식, TCP 프로토콜 `v2`와 핵심 작업 순서를 유지하면서 데이터 무결성, 실패 가시성, 초급 사용자 안내와 관리자 상태 요약을 보강한 정식 릴리즈입니다.
+
+주요 변경:
+
+- 업로드·삭제의 파일/CSV 경계와 HTTP/TCP 측정의 JSON/CSV 경계에 durable transaction과 재시작 복구 적용
+- 손상·충돌 transaction은 자동 정상 추정하지 않고 fail-closed하며, 미정리 측정 marker는 새 세션과 네트워크 전송 전에 `MEASUREMENT_RECOVERY_PENDING` 503으로 차단
+- 연결·명령·요청 시간 상한, 동시 실행 제한, 중복 실행 방지, 취소·종료 시 gate·소켓·요청 worker 정리 강화
+- 0바이트, 잘못된 합계, 빈 결과와 변경된 응답 형식이 성공으로 저장되지 않도록 HTTP/TCP 결과 검증 강화
+- 결과 JSON을 한 번만 읽고 삭제 경합·잘못된 UTF-8·손상 JSON을 경로·traceback 없는 `RESULT_READ_FAILED`로 반환
+- 시작 설정, 포트 변경 거절, 저장 실패와 권한 오류를 안정된 한국어 오류 코드와 다음 조치로 안내
+- 첫 화면의 작업 순서, 진행 상태, 중복 클릭 방지, 부분 실패 표현과 정상·주의·장애 구분 개선
+- `/api/health`와 민감정보 없는 `/api/operations-summary`를 이용한 관리자 요약, 문제 우선 정렬과 권장 조치 추가
+- 측정 API의 `no-store`·`nosniff`, 회전 진단 로그, 실패 counter와 기본 config/header-only CSV 저장소 검사 추가
+- Windows 반복 시험에 working set·handle·thread·TCP socket 계측과 독립 분석기를 추가하고 주간 45분 workflow에 판정 gate 적용
+- 실제 소스 근거, 사용자별 평가와 P0/P1/P2 계획을 담은 한국어 진단 보고서 추가
+- Windows PowerShell 5.1용 스크립트 BOM, 실행 CMD의 UTF-8 no-BOM과 local/Actions native 종료 코드 검사를 적용하고, 기존 annotated tag와 checkout commit 일치·`--verify-tag`를 Release 게시 조건으로 강제
+
+검증 근거:
+
+- 전체 회귀 458건과 장애 주입 32건 통과
+- Python `compileall`, JavaScript 5개 `node --check`, `pip check`, `git diff --check` 통과
+- Windows 2,708.89초 반복 시험: 386 cycles, 업로드 101,187,584 bytes, TCP 자체 점검 386회, 772 processes/1,544 samples
+- soak 분석 결과: quality `pass`, issues 0, findings 0, `PASS_NO_REPEATED_PROCESS_GROWTH`
+- 게시 전 `v0.5.0` onedir ZIP의 서버 smoke, 서버 TCP 자체 점검, 클라이언트 자체 점검, 보안 산출물과 ZIP verifier를 모두 통과해야 하며 태그 workflow가 같은 빌드를 다시 수행합니다.
+
+남은 운영 한계:
+
+- 코드서명, 로그인과 TLS는 포함하지 않습니다. 신뢰 VLAN과 ACL 밖에 노출하지 마세요.
+- HTTP/TCP 토큰과 데이터는 평문이며 요청 Host 기반 클라이언트 주소 생성, 파일 크기 무제한, 압축 내부 미검사와 장기 폴링이 유지됩니다.
+- 45분 PASS는 반복 재기동 자원 추이에 관한 판정이며 단일 프로세스 장기 누수 부재를 증명하지 않습니다.
+- 실제 Edge/Chrome/Android/NVDA, 한글·저권한 현장 경로와 실제 사내 네트워크 품질은 배포 환경에서 별도 확인해야 합니다.
 
 ## v0.4.6 - 2026-07-16
 
@@ -395,7 +429,7 @@ Windows 자체 TCP 정밀 측정을 추가한 사전 릴리즈입니다.
 
 - 지속 측정은 브라우저 HTTP 응용 전송 성능입니다.
 - TCP 재전송·CWND나 UDP 손실·지터를 측정하는 iperf 대체 기능은 포함하지 않습니다.
-- `v0.4.0` TCP와 `v0.5.0` UDP 정밀 측정은 후속 계획입니다.
+- TCP·UDP 정밀 측정 확장은 당시 후속 계획이었습니다.
 
 ## v0.2.2 - 2026-07-09
 
@@ -484,14 +518,14 @@ GitHub에 push하거나 Release를 준비하기 전에 아래 문서를 함께 �
 
 현재 GitHub Release는 태그 기준으로 생성하고, Windows 실행 ZIP은 GitHub Actions에서 빌드해 업로드합니다.
 
-- 태그 형식: 사전 릴리즈는 `v0.4.6-rc.2`, 정식 릴리즈는 `v0.4.6`처럼 관리합니다.
-- Release 제목: `v0.4.6 - 사내 업로드 Windows 안정성 개선`
+- 태그 형식: 사전 릴리즈는 `v0.5.0-rc.1`, 정식 릴리즈는 `v0.5.0`처럼 관리합니다.
+- Release 제목: `v0.5.0 - 사내 업로드 사용성 및 안정성 개선`
 - Release 본문: 포함 기능, 제외 항목, 검증 명령, 실행 방법, asset 정책을 한국어로 적습니다.
-- 직접 업로드하는 Release asset: `internal-upload_v0.4.6_windows.zip`, `.zip.sha256`
+- 직접 업로드하는 Release asset: `internal-upload_v0.5.0_windows.zip`, `.zip.sha256`
 - SHA256 checksum은 별도 asset과 Release 본문에 기록합니다.
 - 같은 태그의 GitHub Release가 이미 있으면 실패 처리하며 기존 asset을 덮어쓰지 않습니다.
 
-GitHub가 자동으로 표시하는 `Source code (zip)` / `Source code (tar.gz)`는 tag 기준 소스 아카이브입니다. 일반 사용자는 `internal-upload_v0.4.6_windows.zip`을 다운로드합니다.
+GitHub가 자동으로 표시하는 `Source code (zip)` / `Source code (tar.gz)`는 tag 기준 소스 아카이브입니다. 일반 사용자는 `internal-upload_v0.5.0_windows.zip`을 다운로드합니다.
 
 ZIP 내부 구조:
 
@@ -515,31 +549,33 @@ ZIP 내부 구조:
 Release 또는 GitHub push 전에 다음 검증을 실행합니다.
 
 ```powershell
-python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
 python -m pytest -q
 ```
 
 macOS 작업 환경에서는 다음 명령을 사용합니다.
 
 ```bash
-.venv/bin/python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+.venv/bin/python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
 .venv/bin/python -m pytest -q
 ```
 
 Windows Release ZIP 검증은 GitHub Actions `windows-latest`에서 실행합니다.
 
 ```powershell
-python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
 node --check static/network_check.js
 node --check static/network_sustained.js
 node --check static/network_probe.js
 node --check static/throughput_chart.js
+node --check static/operations_dashboard.js
 python -m pytest -q
-pwsh -NoProfile -File .\tools\build_windows_release.ps1 -Version v0.4.6
-dist\internal-upload_v0.4.6_windows\InternalUploadServer.exe --smoke-check
-dist\internal-upload_v0.4.6_windows\InternalUploadServer.exe --probe-self-check
-dist\internal-upload_v0.4.6_windows\client-template\NetworkProbeClient.exe --self-check
-python tools\verify_release_zip.py --zip dist\internal-upload_v0.4.6_windows.zip --version v0.4.6
+python tools\run_stability_fault_suite.py
+pwsh -NoProfile -File .\tools\build_windows_release.ps1 -Version v0.5.0
+dist\internal-upload_v0.5.0_windows\InternalUploadServer.exe --smoke-check
+dist\internal-upload_v0.5.0_windows\InternalUploadServer.exe --probe-self-check
+dist\internal-upload_v0.5.0_windows\client-template\NetworkProbeClient.exe --self-check
+python tools\verify_release_zip.py --zip dist\internal-upload_v0.5.0_windows.zip --version v0.5.0
 ```
 
 ## 작성하지 않을 내용

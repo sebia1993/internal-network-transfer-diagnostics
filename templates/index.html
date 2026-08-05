@@ -3,18 +3,19 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>사내 업로드</title>
+    <title>사내 파일 전송 및 네트워크 체크</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <script defer src="{{ url_for('static', filename='network_check.js') }}"></script>
     <script defer src="{{ url_for('static', filename='throughput_chart.js') }}"></script>
     <script defer src="{{ url_for('static', filename='network_sustained.js') }}"></script>
     <script defer src="{{ url_for('static', filename='network_probe.js') }}"></script>
+    <script defer src="{{ url_for('static', filename='operations_dashboard.js') }}"></script>
   </head>
   <body>
     <header class="topbar">
       <div>
-        <h1>사내 업로드</h1>
-        <p>접속 IP {{ client_ip }} · 저장 기준 {{ config.storage_root }}</p>
+        <h1>사내 파일 전송 및 네트워크 체크</h1>
+        <p>파일 업로드와 HTTP/TCP 전송 성능을 한 화면에서 확인합니다.</p>
       </div>
       <div class="statusline">
         {% if can_delete %}
@@ -26,16 +27,187 @@
       </div>
     </header>
 
-    <nav class="mode-tabs" aria-label="작업 모드">
-      <button type="button" class="tab-button is-active" data-tab-button="upload-mode">파일 업로드</button>
-      <button type="button" class="tab-button" data-tab-button="network-mode">네트워크 체크</button>
+    <section
+      class="panel operations-dashboard"
+      aria-labelledby="operations-dashboard-title"
+      aria-busy="true"
+      data-operations-dashboard
+      data-health-url="{{ url_for('health_check') }}"
+      data-summary-url="{{ url_for('operations_summary') }}">
+      <div class="section-title operations-dashboard-header">
+        <div>
+          <h2 id="operations-dashboard-title">운영 요약</h2>
+          <p>현재 서버 상태와 최근 측정 표본을 요약합니다. 장비 수나 전체 네트워크 상태를 뜻하지 않습니다.</p>
+        </div>
+        <div class="operations-dashboard-actions">
+          <span
+            class="status-indicator is-running"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            data-operations-overall>확인 중</span>
+          <button
+            type="button"
+            class="secondary"
+            aria-describedby="operations-refresh-note"
+            data-operations-refresh>지금 새로고침</button>
+        </div>
+      </div>
+
+      <p
+        id="operations-refresh-note"
+        class="operations-refresh-note"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        data-operations-message>
+        상태 정보를 불러오는 중입니다. 화면이 열려 있을 때 30초마다 갱신합니다.
+      </p>
+
+      <div class="operations-summary-grid" aria-label="최근 측정 표본 상태">
+        <article class="operations-count-card is-success">
+          <span>완료 표본</span>
+          <strong data-operations-count="normal">-</strong>
+        </article>
+        <article class="operations-count-card is-warning">
+          <span>취소 표본</span>
+          <strong data-operations-count="warning">-</strong>
+        </article>
+        <article class="operations-count-card is-error">
+          <span>실패 표본</span>
+          <strong data-operations-count="problem">-</strong>
+        </article>
+        <article class="operations-count-card">
+          <span>확인한 최근 표본</span>
+          <strong data-operations-sample-size>-</strong>
+        </article>
+      </div>
+
+      <div class="operations-current-grid" aria-label="현재 작업 상태">
+        <article class="operations-current-card is-idle" data-operations-current-card="measurement">
+          <span>네트워크 측정</span>
+          <strong data-operations-current="measurement">확인 중</strong>
+          <small data-operations-current-detail="measurement">현재 작업 확인 중</small>
+        </article>
+        <article class="operations-current-card is-idle" data-operations-current-card="uploads">
+          <span>파일 업로드</span>
+          <strong data-operations-current="uploads">확인 중</strong>
+          <small data-operations-current-detail="uploads">현재 작업 확인 중</small>
+        </article>
+        <article class="operations-current-card is-idle" data-operations-current-card="tcp">
+          <span>TCP 측정 서비스</span>
+          <strong data-operations-current="tcp">확인 중</strong>
+          <small data-operations-current-detail="tcp">서비스 상태 확인 중</small>
+        </article>
+      </div>
+
+      <div class="operations-dashboard-body">
+        <section aria-labelledby="operations-issues-title">
+          <h3 id="operations-issues-title">최근 문제 우선</h3>
+          <p class="operations-scope-note">
+            최근 측정 표본 중 실패를 먼저, 취소를 그다음으로 최대 5건 표시합니다.
+            과거 기록이며 현재 미조치 장애라는 뜻은 아닙니다.
+          </p>
+          <ol
+            class="operations-issue-list"
+            tabindex="0"
+            aria-label="최근 실패와 취소 측정 표본"
+            aria-live="polite"
+            aria-atomic="false"
+            data-operations-issues>
+            <li class="empty">최근 문제를 확인하는 중입니다.</li>
+          </ol>
+        </section>
+
+        <aside class="operations-recommendation" aria-labelledby="operations-action-title">
+          <h3 id="operations-action-title">권장 조치</h3>
+          <p
+            class="operation-guidance is-running"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            data-operations-recommendation>
+            현재 상태 확인이 끝날 때까지 기다리세요.
+          </p>
+        </aside>
+      </div>
+
+      <section class="operations-changes" aria-labelledby="operations-changes-title">
+        <h3 id="operations-changes-title">최근 측정 상태 변경</h3>
+        <p class="operations-scope-note">
+          같은 측정 방식과 방향에서 완료·취소·실패 상태가 바뀐 기록만 표시합니다.
+          속도 품질 변화나 장비 장애 이력은 아닙니다.
+        </p>
+        <ol
+          class="operations-change-list"
+          aria-live="polite"
+          aria-atomic="false"
+          data-operations-changes>
+          <li class="empty">최근 상태 변경을 확인하는 중입니다.</li>
+        </ol>
+      </section>
+
+      <details class="result-disclosure operations-technical-details">
+        <summary>기술 상태 및 원본 API</summary>
+        <p class="operations-scope-note">
+          운영 요약에는 저장소·결과 파일·TCP 서비스의 상태만 표시하며 IP, PC 이름, 원시 오류는 표시하지 않습니다.
+          조치 확인·담당자·해결 이력은 이 화면에서 기록하지 않습니다.
+        </p>
+        <dl class="technical-meta-grid">
+          <div><dt>저장소</dt><dd data-operations-technical="storage">확인 중</dd></div>
+          <div><dt>결과 파일</dt><dd data-operations-technical="csv">확인 중</dd></div>
+          <div><dt>TCP 서비스</dt><dd data-operations-technical="tcp">확인 중</dd></div>
+          <div><dt>백그라운드 저장</dt><dd data-operations-technical="background">확인 중</dd></div>
+          <div><dt>마지막 갱신</dt><dd data-operations-generated-at>-</dd></div>
+        </dl>
+        <div class="actions">
+          <a class="secondary" href="{{ url_for('health_check') }}" target="_blank" rel="noopener">상태 API 열기</a>
+          <a class="secondary" href="{{ url_for('operations_summary') }}" target="_blank" rel="noopener">운영 요약 API 열기</a>
+        </div>
+      </details>
+    </section>
+
+    <nav class="mode-tabs" role="tablist" aria-label="작업 모드">
+      <button
+        type="button"
+        id="upload-mode-tab"
+        class="tab-button is-active"
+        role="tab"
+        aria-selected="true"
+        aria-controls="upload-mode"
+        tabindex="0"
+        data-tab-button="upload-mode">파일 업로드</button>
+      <button
+        type="button"
+        id="network-mode-tab"
+        class="tab-button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="network-mode"
+        tabindex="-1"
+        data-tab-button="network-mode">네트워크 체크</button>
     </nav>
 
-    <section id="upload-mode" class="tab-panel is-active" data-tab-panel>
+    <section
+      id="upload-mode"
+      class="tab-panel is-active"
+      role="tabpanel"
+      aria-labelledby="upload-mode-tab"
+      tabindex="0"
+      data-tab-panel>
       <main class="layout">
         <section class="panel upload-panel">
           <h2>파일 업로드</h2>
-          <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+          <p id="upload-form-help" class="workflow-hint">
+            1. 파일 선택 · 2. 필요하면 저장 폴더와 메모 입력 · 3. 업로드 실행
+          </p>
+          <form
+            action="{{ url_for('upload') }}"
+            method="post"
+            enctype="multipart/form-data"
+            aria-describedby="upload-form-help upload-submit-status"
+            aria-busy="false"
+            data-upload-form>
             <label>
               <span>파일</span>
               <input type="file" name="file" required>
@@ -60,7 +232,16 @@
               <span>같은 이름이 있으면 ID를 붙여 저장</span>
             </label>
 
-            <button type="submit" class="primary">업로드</button>
+            <button type="submit" class="primary" data-upload-submit>업로드</button>
+            <p
+              id="upload-submit-status"
+              class="operation-guidance is-idle"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              data-upload-submit-status>
+              대기 · 파일을 선택한 뒤 업로드를 누르세요.
+            </p>
           </form>
         </section>
 
@@ -68,25 +249,33 @@
           <h2>처리 결과</h2>
 
           {% if deleted %}
-            <div class="notice success">파일과 CSV 기록을 삭제했습니다.</div>
+            <div class="notice success" role="status">
+              <strong>정상 · 삭제 완료</strong>
+              <p>파일과 CSV 기록을 삭제했습니다. 다음 조치: 최근 업로드 목록에서 항목이 사라졌는지 확인하세요.</p>
+            </div>
           {% endif %}
 
           {% if error %}
-            <div class="notice error">{{ error }}</div>
+            <div class="notice error" role="alert">
+              <strong>장애 · 처리 실패</strong>
+              <p>{{ error }}</p>
+              <p>다음 조치: 안내 내용을 확인한 뒤 입력값과 서버 저장 공간을 점검하고 다시 시도하세요.</p>
+            </div>
           {% endif %}
 
           {% if conflict %}
-            <div class="notice warning">
-              <strong>같은 이름의 파일이 이미 존재합니다.</strong>
+            <div class="notice warning" role="alert">
+              <strong>주의 · 같은 이름의 파일이 이미 존재합니다.</strong>
               <p>{{ conflict.storage_subdir }} 위치에 {{ conflict.filename }} 파일이 있습니다.</p>
-              <p>그래도 업로드하려면 파일을 다시 선택하고 “같은 이름이 있으면 ID를 붙여 저장”을 체크하세요.</p>
+              <p>다음 조치: 그래도 업로드하려면 파일을 다시 선택하고 “같은 이름이 있으면 ID를 붙여 저장”을 체크하세요.</p>
             </div>
           {% endif %}
 
           {% if result %}
-            <div class="notice success">
-              <strong>업로드 완료</strong>
+            <div class="notice success" role="status">
+              <strong>정상 · 업로드 완료</strong>
               <p>{{ result.original_filename }} → {{ result.stored_filename }}</p>
+              <p>다음 조치: 아래 링크로 다운로드가 되는지 확인한 뒤 공유하세요.</p>
             </div>
 
             <label class="link-box">
@@ -99,8 +288,10 @@
             </div>
 
             {% if result.loopback_warning %}
-              <div class="notice warning">
-                localhost 또는 127.0.0.1 링크는 다른 PC에서 사용할 수 없습니다. config.ini의 BASE_URL 또는 서버 PC 사내 IP를 확인하세요.
+              <div class="notice warning" role="alert">
+                <strong>주의 · 다른 PC에서 열 수 없는 링크입니다.</strong>
+                <p>localhost 또는 127.0.0.1 링크는 다른 PC에서 사용할 수 없습니다.</p>
+                <p>다음 조치: config.ini의 BASE_URL 또는 서버 PC 사내 IP를 확인하세요.</p>
               </div>
             {% endif %}
           {% else %}
@@ -118,15 +309,16 @@
         {% if records %}
           <div class="table-wrap">
             <table>
+              <caption class="visually-hidden">최근 업로드 파일과 다운로드 링크</caption>
               <thead>
                 <tr>
-                  <th>일시</th>
-                  <th>파일</th>
-                  <th>저장 폴더</th>
-                  <th>메모</th>
-                  <th>링크</th>
+                  <th scope="col">일시</th>
+                  <th scope="col">파일</th>
+                  <th scope="col">저장 폴더</th>
+                  <th scope="col">메모</th>
+                  <th scope="col">링크</th>
                   {% if can_delete %}
-                    <th>삭제</th>
+                    <th scope="col">삭제</th>
                   {% endif %}
                 </tr>
               </thead>
@@ -147,7 +339,10 @@
                           action="{{ url_for('delete', upload_id=record.upload_id) }}"
                           method="post"
                           onsubmit="return confirm('파일과 CSV 기록을 삭제할까요?');">
-                          <button type="submit" class="danger">삭제</button>
+                          <button
+                            type="submit"
+                            class="danger"
+                            aria-label="{{ record.original_filename }} 삭제">삭제</button>
                         </form>
                       </td>
                     {% endif %}
@@ -162,7 +357,14 @@
       </section>
     </section>
 
-    <section id="network-mode" class="tab-panel" data-tab-panel hidden>
+    <section
+      id="network-mode"
+      class="tab-panel"
+      role="tabpanel"
+      aria-labelledby="network-mode-tab"
+      tabindex="0"
+      data-tab-panel
+      hidden>
       <main
         class="network-layout"
         data-network-check
@@ -178,11 +380,31 @@
           <h2>네트워크 체크</h2>
 
           <div class="measurement-tabs" role="tablist" aria-label="네트워크 측정 방식">
-            <button type="button" class="measurement-tab is-active" data-measurement-mode="http" aria-selected="true">HTTP 전송 측정</button>
-            <button type="button" class="measurement-tab" data-measurement-mode="probe" aria-selected="false">TCP 전송 성능 측정</button>
+            <button
+              type="button"
+              id="http-measurement-tab"
+              class="measurement-tab is-active"
+              role="tab"
+              aria-selected="true"
+              aria-controls="http-measurement-control http-measurement-result"
+              tabindex="0"
+              data-measurement-mode="http">HTTP 전송 측정</button>
+            <button
+              type="button"
+              id="probe-measurement-tab"
+              class="measurement-tab"
+              role="tab"
+              aria-selected="false"
+              aria-controls="probe-measurement-control probe-measurement-result"
+              tabindex="-1"
+              data-measurement-mode="probe">TCP 전송 성능 측정</button>
           </div>
 
-          <div data-measurement-control="http">
+          <div
+            id="http-measurement-control"
+            role="tabpanel"
+            aria-labelledby="http-measurement-tab"
+            data-measurement-control="http">
             <fieldset class="control-group">
               <legend>측정 종료 기준</legend>
               <div class="segment-control">
@@ -235,9 +457,19 @@
             </div>
           </div>
 
-          <div data-measurement-control="probe" hidden>
-            <div class="probe-service-status notice warning" data-probe-service-status>
-              TCP 측정 서버 상태 확인 중
+          <div
+            id="probe-measurement-control"
+            role="tabpanel"
+            aria-labelledby="probe-measurement-tab"
+            data-measurement-control="probe"
+            hidden>
+            <div
+              class="probe-service-status notice warning"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              data-probe-service-status>
+              주의 · TCP 측정 서버 상태 확인 중
             </div>
 
             <div class="probe-client-package">
@@ -255,8 +487,13 @@
               </select>
             </label>
 
-            <div class="probe-client-readiness notice warning" data-probe-client-readiness>
-              연결할 Windows 클라이언트를 기다리는 중입니다.
+            <div
+              class="probe-client-readiness notice warning"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              data-probe-client-readiness>
+              주의 · 연결할 Windows 클라이언트를 기다리는 중입니다. 다음 조치: Windows 클라이언트 ZIP을 실행하세요.
             </div>
 
             <label>
@@ -285,17 +522,41 @@
           </div>
         </section>
 
-        <section class="panel network-result-panel" aria-live="polite">
-          <div data-measurement-result="http">
+        <section class="panel network-result-panel">
+          <div
+            id="http-measurement-result"
+            role="tabpanel"
+            aria-labelledby="http-measurement-tab"
+            data-measurement-result="http">
             <div data-http-criterion-result="simple">
               <div class="section-title">
                 <h2>데이터량 기준 결과</h2>
-                <span data-network-status>대기</span>
+                <span
+                  class="status-indicator is-idle"
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                  data-network-status>대기</span>
               </div>
 
-              <div class="progress-track" aria-hidden="true">
+              <div
+                class="progress-track"
+                role="progressbar"
+                aria-label="데이터량 기준 측정 진행률"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+                aria-valuetext="대기 · 0%">
                 <div class="progress-bar" data-progress-bar></div>
               </div>
+              <p
+                class="operation-guidance is-idle"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                data-network-guidance>
+                대기 · 측정 종류와 데이터량을 선택한 뒤 측정을 시작하세요.
+              </p>
 
               <dl class="metric-grid">
                 <div>
@@ -312,7 +573,7 @@
                 </div>
                 <div>
                   <dt>측정 요약</dt>
-                  <dd data-summary>-</dd>
+                  <dd role="status" aria-live="polite" aria-atomic="true" data-summary>-</dd>
                 </div>
               </dl>
 
@@ -325,12 +586,32 @@
             <div data-http-criterion-result="sustained" hidden>
               <div class="section-title">
                 <h2>측정 시간 기준 결과</h2>
-                <span data-sustained-status>대기</span>
+                <span
+                  class="status-indicator is-idle"
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                  data-sustained-status>대기</span>
               </div>
 
-              <div class="progress-track" aria-hidden="true">
+              <div
+                class="progress-track"
+                role="progressbar"
+                aria-label="측정 시간 기준 진행률"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+                aria-valuetext="대기 · 0%">
                 <div class="progress-bar" data-sustained-progress-bar></div>
               </div>
+              <p
+                class="operation-guidance is-idle"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                data-sustained-guidance>
+                대기 · 측정 방향과 시간을 선택한 뒤 측정을 시작하세요.
+              </p>
 
               <div class="sustained-phase" data-sustained-phase>대기</div>
 
@@ -379,15 +660,40 @@
             </div>
           </div>
 
-          <div data-measurement-result="probe" hidden>
+          <div
+            id="probe-measurement-result"
+            role="tabpanel"
+            aria-labelledby="probe-measurement-tab"
+            data-measurement-result="probe"
+            hidden>
             <div class="section-title">
               <h2>TCP 전송 성능 측정 결과</h2>
-              <span data-probe-status>대기</span>
+              <span
+                class="status-indicator is-idle"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                data-probe-status>대기</span>
             </div>
 
-            <div class="progress-track" aria-hidden="true">
+            <div
+              class="progress-track"
+              role="progressbar"
+              aria-label="TCP 전송 성능 측정 진행률"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+              aria-valuetext="대기 · 0%">
               <div class="progress-bar" data-probe-progress-bar></div>
             </div>
+            <p
+              class="operation-guidance is-idle"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              data-probe-guidance>
+              대기 · Windows 클라이언트가 준비되면 측정 방향을 선택하세요.
+            </p>
 
             <div class="sustained-phase" data-probe-phase>클라이언트 연결 대기</div>
 

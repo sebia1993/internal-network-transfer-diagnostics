@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import logging
 import os
 import threading
 import time
@@ -12,6 +13,7 @@ import pytest
 import app as app_module
 from app_version import APP_VERSION
 from app import (
+    CSV_FIELDS,
     NETWORK_CHECK_FIELDS,
     build_download_url,
     create_app,
@@ -57,6 +59,33 @@ def write_config(tmp_path: Path, *, base_url: str = "http://files.local:8000") -
     return config_path
 
 
+def test_repository_runtime_templates_are_sanitized_and_header_only():
+    project_root = Path(__file__).resolve().parents[1]
+    expected_headers = {
+        "upload_log.csv": CSV_FIELDS,
+        "network_check_log.csv": NETWORK_CHECK_FIELDS,
+        "network_check_session_log.csv": SUSTAINED_LOG_FIELDS,
+        "network_probe_log.csv": PROBE_LOG_FIELDS,
+    }
+    for filename, expected_header in expected_headers.items():
+        with (project_root / "data" / filename).open(
+            "r",
+            encoding="utf-8-sig",
+            newline="",
+        ) as handle:
+            assert list(csv.reader(handle)) == [expected_header]
+
+    config = load_config(project_root / "config.ini")
+    assert config.host == "0.0.0.0"
+    assert config.port == 8000
+    assert config.base_url == ""
+    assert config.storage_root == project_root / "uploads"
+    assert config.delete_allowed_ips == ("127.0.0.1", "::1")
+    assert config.recent_limit == 50
+    assert config.network_probe_enabled is True
+    assert config.network_probe_port == 5201
+
+
 @pytest.fixture()
 def app_client(tmp_path):
     config_path = write_config(tmp_path)
@@ -73,6 +102,17 @@ def post_file(client, filename="장애로그.txt", content=b"hello", **fields):
     }
     data.update(fields)
     return client.post("/upload", data=data, content_type="multipart/form-data")
+
+
+class FakeMonotonicClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def test_base_url_download_link(tmp_path):
@@ -284,9 +324,11 @@ def test_upload_replace_failure_removes_temporary_artifacts(app_client, monkeypa
 
     monkeypatch.setattr(app_module, "durable_replace", fail_upload_replace)
 
-    with pytest.raises(OSError, match="replace failed"):
-        post_file(client, filename="incomplete.txt", content=b"partial")
+    response = post_file(client, filename="incomplete.txt", content=b"partial")
 
+    assert response.status_code == 500
+    assert "UPLOAD_PROCESSING_FAILED" in response.get_data(as_text=True)
+    assert "replace failed" not in response.get_data(as_text=True)
     assert not (config.storage_root / "incomplete.txt").exists()
     assert list(config.storage_root.rglob(f"{app_module.UPLOAD_ARTIFACT_PREFIX}*")) == []
 
@@ -463,9 +505,11 @@ def test_upload_log_failure_removes_saved_file(app_client, monkeypatch):
 
     monkeypatch.setattr(app_module, "append_upload_log", fail_append_upload_log)
 
-    with pytest.raises(OSError, match="log write failed"):
-        post_file(client, filename="orphan.txt", content=b"orphan")
+    response = post_file(client, filename="orphan.txt", content=b"orphan")
 
+    assert response.status_code == 500
+    assert "UPLOAD_PROCESSING_FAILED" in response.get_data(as_text=True)
+    assert "log write failed" not in response.get_data(as_text=True)
     assert not (config.storage_root / "orphan.txt").exists()
 
 
@@ -480,9 +524,11 @@ def test_upload_partial_log_write_failure_rolls_back_csv_and_file(app_client, mo
 
     monkeypatch.setattr(csv.DictWriter, "writerow", write_then_fail)
 
-    with pytest.raises(OSError, match="partial log write"):
-        post_file(client, filename="partial.txt", content=b"partial")
+    response = post_file(client, filename="partial.txt", content=b"partial")
 
+    assert response.status_code == 500
+    assert "UPLOAD_PROCESSING_FAILED" in response.get_data(as_text=True)
+    assert "partial log write" not in response.get_data(as_text=True)
     assert not (config.storage_root / "partial.txt").exists()
     assert config.log_path.read_bytes() == original_log
 
@@ -626,12 +672,14 @@ def test_delete_log_write_failure_preserves_file_and_record(app_client, monkeypa
 
     monkeypatch.setattr(csv.DictWriter, "writerows", fail_writerows)
 
-    with pytest.raises(OSError, match="log write failed"):
-        client.post(
-            f"/delete/{row['upload_id']}",
-            environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
-        )
+    response = client.post(
+        f"/delete/{row['upload_id']}",
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
 
+    assert response.status_code == 500
+    assert "DELETE_PROCESSING_FAILED" in response.get_data(as_text=True)
+    assert "log write failed" not in response.get_data(as_text=True)
     assert Path(row["storage_path"]).read_bytes() == b"keep me"
     assert read_upload_log(config) == [row]
 
@@ -650,12 +698,14 @@ def test_delete_file_failure_restores_upload_record(app_client, monkeypatch):
 
     monkeypatch.setattr(Path, "unlink", fail_target_unlink)
 
-    with pytest.raises(PermissionError, match="file is locked"):
-        client.post(
-            f"/delete/{row['upload_id']}",
-            environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
-        )
+    response = client.post(
+        f"/delete/{row['upload_id']}",
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
 
+    assert response.status_code == 500
+    assert "DELETE_PROCESSING_FAILED" in response.get_data(as_text=True)
+    assert "file is locked" not in response.get_data(as_text=True)
     assert file_path.read_bytes() == b"locked"
     assert read_upload_log(config) == [row]
 
@@ -845,6 +895,180 @@ def test_network_check_upload_session_automatically_expires_and_releases_gate(tm
     assert rows[0]["status"] == "failure"
 
 
+def test_network_check_upload_session_stays_active_beyond_ttl_with_recent_chunks(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app_module, "MEGABYTE", 1)
+    config_path = write_config(tmp_path)
+    clock = FakeMonotonicClock()
+    gate = NetworkMeasurementGate(
+        clock=clock,
+        max_hold_seconds={
+            "http_quick": app_module.NETWORK_CHECK_UPLOAD_SESSION_MAX_SECONDS
+        },
+    )
+    flask_app = create_app(
+        config_path,
+        measurement_gate=gate,
+        network_check_clock=clock,
+    )
+    flask_app.config.update(TESTING=True)
+    config = load_config(config_path)
+
+    with flask_app.test_client() as client:
+        started = client.post("/network-check/upload/start?size_mb=10")
+        session_id = started.json["session_id"]
+
+        clock.advance(app_module.NETWORK_CHECK_UPLOAD_SESSION_TTL_SECONDS - 1)
+        first_chunk = client.post(
+            f"/network-check/upload/chunk/{session_id}",
+            data=b"x" * 5,
+            content_type="application/octet-stream",
+        )
+        clock.advance(app_module.NETWORK_CHECK_UPLOAD_SESSION_TTL_SECONDS - 1)
+
+        expire_session = flask_app.extensions["network_check_upload_expire"]
+        expire_session(session_id, 1)
+        expire_session(session_id)
+        assert gate.is_available() is False
+
+        second_chunk = client.post(
+            f"/network-check/upload/chunk/{session_id}",
+            data=b"x" * 5,
+            content_type="application/octet-stream",
+        )
+        finished = client.post(f"/network-check/upload/finish/{session_id}")
+
+    assert started.status_code == 200
+    assert first_chunk.status_code == 200
+    assert second_chunk.status_code == 200
+    assert finished.status_code == 200
+    assert finished.json["status"] == "success"
+    assert gate.is_available() is True
+    rows = read_network_check_log(config)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "success"
+    assert rows[0]["bytes_transferred"] == "10"
+
+
+def test_network_check_empty_upload_chunk_fails_and_releases_gate(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app_module, "MEGABYTE", 1)
+    config_path = write_config(tmp_path)
+    gate = NetworkMeasurementGate()
+    flask_app = create_app(config_path, measurement_gate=gate)
+    flask_app.config.update(TESTING=True)
+    config = load_config(config_path)
+
+    with flask_app.test_client() as client:
+        started = client.post("/network-check/upload/start?size_mb=10")
+        session_id = started.json["session_id"]
+        empty = client.post(
+            f"/network-check/upload/chunk/{session_id}",
+            data=b"",
+            content_type="application/octet-stream",
+        )
+        replacement = client.post("/network-check/upload/start?size_mb=10")
+        flask_app.extensions["shutdown_network_measurements"]()
+
+    assert empty.status_code == 400
+    assert empty.json["status"] == "failure"
+    assert replacement.status_code == 200
+    rows = read_network_check_log(config)
+    assert [row["status"] for row in rows] == ["failure", "failure"]
+
+
+def test_network_check_gate_max_hold_cancels_session_and_allows_retry(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app_module, "MEGABYTE", 1)
+    config_path = write_config(tmp_path)
+    gate = NetworkMeasurementGate(
+        max_hold_seconds={"http_quick": 0.02},
+    )
+    flask_app = create_app(config_path, measurement_gate=gate)
+    flask_app.config.update(TESTING=True)
+    config = load_config(config_path)
+
+    with flask_app.test_client() as client:
+        started = client.post("/network-check/upload/start?size_mb=10")
+        time.sleep(0.04)
+        status = gate.status()
+        replacement = client.post("/network-check/upload/start?size_mb=10")
+        flask_app.extensions["shutdown_network_measurements"]()
+
+    assert started.status_code == 200
+    assert status["active"] is False
+    assert status["expired_count"] == 1
+    assert replacement.status_code == 200
+    rows = read_network_check_log(config)
+    assert len(rows) == 2
+    assert all(row["status"] == "failure" for row in rows)
+
+
+def test_network_check_upload_session_expires_only_after_inactivity(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app_module, "MEGABYTE", 1)
+    config_path = write_config(tmp_path)
+    gate = NetworkMeasurementGate()
+    clock = FakeMonotonicClock()
+    flask_app = create_app(
+        config_path,
+        measurement_gate=gate,
+        network_check_clock=clock,
+    )
+    flask_app.config.update(TESTING=True)
+    config = load_config(config_path)
+
+    with flask_app.test_client() as client:
+        started = client.post("/network-check/upload/start?size_mb=10")
+        session_id = started.json["session_id"]
+        clock.advance(app_module.NETWORK_CHECK_UPLOAD_SESSION_TTL_SECONDS)
+
+        flask_app.extensions["network_check_upload_expire"](session_id)
+        finished = client.post(f"/network-check/upload/finish/{session_id}")
+
+    assert started.status_code == 200
+    assert finished.status_code == 404
+    assert gate.is_available() is True
+    rows = read_network_check_log(config)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failure"
+
+
+def test_shutdown_records_pending_quick_upload_and_releases_gate(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app_module, "MEGABYTE", 1)
+    config_path = write_config(tmp_path)
+    gate = NetworkMeasurementGate()
+    flask_app = create_app(config_path, measurement_gate=gate)
+    flask_app.config.update(TESTING=True)
+    config = load_config(config_path)
+
+    with flask_app.test_client() as client:
+        started = client.post("/network-check/upload/start?size_mb=10")
+
+    assert started.status_code == 200
+    assert gate.is_available() is False
+
+    shutdown = flask_app.extensions["shutdown_network_measurements"]
+    assert shutdown() == {"quick_uploads": 1, "sustained": 0}
+    assert shutdown() == {"quick_uploads": 0, "sustained": 0}
+    assert gate.is_available() is True
+
+    rows = read_network_check_log(config)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failure"
+
+
 def test_network_check_upload_rejects_oversized_body(app_client, monkeypatch):
     client, config, _ = app_client
     monkeypatch.setattr(app_module, "MEGABYTE", 1024)
@@ -917,7 +1141,9 @@ def test_sustained_network_js_uses_regular_post_chunks():
     assert "낮을수록 측정 중 속도가 일정함" in script
     assert "InternalUploadThroughputChart" in script
     assert "syncCharts" in script
-    assert script.index("if (result.excel_url)") < script.index('if (result.status !== "success")')
+    assert script.index("if (result.excel_url)") < script.index(
+        'const partial = result.status !== "success"'
+    )
 
 
 def test_probe_network_js_uses_audience_friendly_summary():
@@ -980,12 +1206,37 @@ def test_windows_release_checksum_uses_portable_lf_line_ending():
     assert "Set-Content -Path $ShaPath" not in script
 
 
+def test_windows_release_script_is_utf8_bom_for_windows_powershell():
+    script_bytes = Path("tools/build_windows_release.ps1").read_bytes()
+    script = script_bytes.decode("utf-8-sig")
+
+    assert script_bytes.startswith(b"\xef\xbb\xbf")
+    assert '$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)' in script
+    assert "[System.IO.File]::WriteAllText($LauncherPath, $LauncherContent, $Utf8NoBom)" in script
+
+
 def test_windows_release_build_requires_source_version_match():
     script = Path("tools/build_windows_release.ps1").read_text(encoding="utf-8")
 
     assert 'from app_version import APP_VERSION' in script
     assert '$SourceVersion -ne $Version' in script
     assert 'does not match requested release' in script
+    assert '$SourceCommit = (git rev-parse HEAD).Trim()' in script
+
+
+def test_windows_release_build_propagates_native_command_failures():
+    script = Path("tools/build_windows_release.ps1").read_text(encoding="utf-8-sig")
+
+    for operation in (
+        "Source version lookup",
+        "Server version metadata generation",
+        "Client version metadata generation",
+        "Server executable build",
+        "Client executable build",
+        "Security artifact generation",
+        "Release ZIP verification",
+    ):
+        assert f'Assert-NativeSuccess "{operation}" $LASTEXITCODE' in script
 
 
 def test_windows_release_build_removes_runtime_lock_and_diagnostics_after_smoke_check():
@@ -997,10 +1248,34 @@ def test_windows_release_build_removes_runtime_lock_and_diagnostics_after_smoke_
     assert 'Remove-Item $RuntimeDiagnostics -Recurse -Force' in script
 
 
-def test_windows_release_workflow_compiles_runtime_stability_module():
+def test_windows_release_workflow_checks_all_release_runtime_modules_and_scripts():
     workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
 
-    assert "startup_ports.py runtime_stability.py network_sustained.py" in workflow
+    assert (
+        "startup_ports.py runtime_stability.py upload_transactions.py "
+        "measurement_transactions.py network_sustained.py"
+    ) in workflow
+    assert "node --check static/operations_dashboard.js" in workflow
+    assert "python tools/run_stability_fault_suite.py" in workflow
+    for operation in (
+        "Python compileall",
+        "network_check.js syntax check",
+        "network_sustained.js syntax check",
+        "network_probe.js syntax check",
+        "throughput_chart.js syntax check",
+        "operations_dashboard.js syntax check",
+        "Python regression tests",
+        "Stability fault suite",
+        "Python dependency check",
+    ):
+        assert f'Assert-NativeSuccess "{operation}" $LASTEXITCODE' in workflow
+    assert f'default: "{APP_VERSION}"' in workflow
+    assert 'git show-ref --verify --quiet "refs/tags/$env:RELEASE_VERSION"' in workflow
+    assert 'git cat-file -t "refs/tags/$env:RELEASE_VERSION"' in workflow
+    assert "must be an annotated tag" in workflow
+    assert "--verify-tag" in workflow
+    assert "--target $env:GITHUB_SHA" not in workflow
+    assert "사내 업로드 사용성 및 안정성 개선" in workflow
 
 
 def test_csv_header_is_utf8_sig(app_client):
@@ -1070,6 +1345,25 @@ def test_app_startup_refuses_upload_log_with_invalid_header(tmp_path):
 
     with pytest.raises(CsvIntegrityError, match="invalid_header"):
         create_app(config_path)
+
+
+def test_smoke_check_reports_corrupt_upload_transaction_without_traceback(
+    tmp_path,
+    capsys,
+):
+    config_path = write_config(tmp_path)
+    config = load_config(config_path)
+    transaction_root = config.log_path.parent / "upload_transactions"
+    transaction_root.mkdir(parents=True)
+    (transaction_root / "broken.json").write_text("{not-json", encoding="utf-8")
+
+    assert run_smoke_check(config_path) == 1
+
+    error_output = capsys.readouterr().err
+    assert "업로드 복구 기록이 손상" in error_output
+    assert "Traceback" not in error_output
+    assert "{not-json" not in error_output
+    assert "broken.json" not in error_output
 
 
 @pytest.mark.parametrize(
@@ -1147,8 +1441,190 @@ def test_health_endpoint_identifies_app_and_active_port(app_client):
         "reserved_remaining_bytes": 0,
         "at_capacity": False,
     }
+    assert payload["checks"]["background_tasks"] == {
+        "status": "ok",
+        "failure_count": 0,
+        "components": {
+            "http_quick": 0,
+            "http_sustained": 0,
+            "tcp_probe": 0,
+        },
+    }
     assert len(response.data) <= 4097
     assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_operations_summary_prioritizes_recent_issues_without_sensitive_fields(
+    app_client,
+):
+    client, config, _ = app_client
+    rows = (
+        (
+            config.network_check_log_path,
+            NETWORK_CHECK_FIELDS,
+            {
+                "checked_at": "2026-07-30 10:00:00 +0900",
+                "client_ip": "10.0.0.10",
+                "direction": "upload",
+                "size_mb": "10",
+                "bytes_transferred": "10485760",
+                "duration_seconds": "1.000",
+                "mbps": "83.89",
+                "status": "success",
+            },
+        ),
+        (
+            config.network_check_session_log_path,
+            SUSTAINED_LOG_FIELDS,
+            {
+                "checked_at": "2026-07-30 10:01:00 +0900",
+                "client_ip": "10.0.0.11",
+                "direction": "download",
+                "status": "failure",
+                "error": "인증 token TOP-SECRET 값이 올바르지 않습니다.",
+            },
+        ),
+        (
+            config.network_probe_log_path,
+            PROBE_LOG_FIELDS,
+            {
+                "checked_at": "2026-07-30 10:02:00 +0900",
+                "agent_hostname": "PRIVATE-PC",
+                "client_ip": "10.0.0.12",
+                "requested_direction": "full",
+                "status": "cancelled",
+                "error": "사용자가 측정을 취소했습니다.",
+            },
+        ),
+    )
+    for path, fieldnames, values in rows:
+        with path.open("a", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writerow({name: values.get(name, "") for name in fieldnames})
+
+    response = client.get("/api/operations-summary")
+
+    assert response.status_code == 200
+    payload = response.json
+    assert payload["sample_size"] == 3
+    assert payload["counts"] == {
+        "normal": 1,
+        "warning": 1,
+        "problem": 1,
+    }
+    assert [item["status_label"] for item in payload["recent_issues"]] == [
+        "취소",
+        "실패",
+    ]
+    assert payload["recent_issues"][1]["failure_category"] == "인증"
+    assert payload["status_changes"] == []
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "TOP-SECRET" not in serialized
+    assert "PRIVATE-PC" not in serialized
+    assert "10.0.0." not in serialized
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_operations_summary_reports_only_actual_status_transitions(
+    app_client,
+):
+    client, config, _ = app_client
+    statuses = [
+        ("2026-07-30 10:00:00 +0900", "success"),
+        ("2026-07-30 10:01:00 +0900", "success"),
+        ("2026-07-30 10:02:00 +0900", "failure"),
+        ("2026-07-30 10:03:00 +0900", "success"),
+    ]
+    with config.network_check_log_path.open(
+        "a",
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=NETWORK_CHECK_FIELDS,
+        )
+        for checked_at, status in statuses:
+            writer.writerow(
+                {
+                    "checked_at": checked_at,
+                    "client_ip": "10.0.0.10",
+                    "direction": "upload",
+                    "size_mb": "10",
+                    "bytes_transferred": "10485760",
+                    "duration_seconds": "1.000",
+                    "mbps": "83.89",
+                    "status": status,
+                }
+            )
+
+    payload = client.get("/api/operations-summary").json
+
+    assert payload["status_changes"] == [
+        {
+            "source": "http_quick",
+            "source_label": "HTTP 데이터량",
+            "direction": "upload",
+            "timestamp": "2026-07-30 10:03:00 +0900",
+            "from_status_label": "실패",
+            "to_status_label": "완료",
+        },
+        {
+            "source": "http_quick",
+            "source_label": "HTTP 데이터량",
+            "direction": "upload",
+            "timestamp": "2026-07-30 10:02:00 +0900",
+            "from_status_label": "완료",
+            "to_status_label": "실패",
+        },
+    ]
+
+
+def test_operations_summary_keeps_other_sources_available_when_one_is_corrupt(
+    app_client,
+):
+    client, config, _ = app_client
+    config.network_probe_log_path.write_text(
+        "wrong,header\nvalue,row\n",
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/operations-summary")
+
+    assert response.status_code == 200
+    assert response.json["unavailable_sources"] == ["tcp_probe"]
+    assert response.json["sample_size"] == 0
+
+
+def test_operations_summary_source_failure_log_does_not_expose_raw_exception(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    logger = logging.getLogger("test.operations-summary.safe-log")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    flask_app = create_app(
+        write_config(tmp_path),
+        diagnostic_logger=logger,
+    )
+
+    def fail_read(*_args, **_kwargs):
+        raise PermissionError(r"C:\private-customer\measurement.csv")
+
+    monkeypatch.setattr(app_module, "read_recent_csv_rows", fail_read)
+
+    response = flask_app.test_client().get("/api/operations-summary")
+
+    assert response.status_code == 200
+    assert response.json["unavailable_sources"] == [
+        "http_quick",
+        "http_sustained",
+        "tcp_probe",
+    ]
+    assert "operations_summary_source_unavailable" in caplog.text
+    assert "error_type=PermissionError" in caplog.text
+    assert "private-customer" not in caplog.text
+    assert "Traceback" not in caplog.text
 
 
 def test_health_endpoint_reports_ok_when_probe_is_disabled_and_storage_is_healthy(tmp_path):
@@ -1204,7 +1680,7 @@ def test_health_endpoint_warns_about_long_running_measurement(tmp_path):
     gate = NetworkMeasurementGate(clock=lambda: now[0])
     flask_app = create_app(config_path, measurement_gate=gate)
     assert gate.acquire("http_quick", "active") is True
-    now[0] = 721.0
+    now[0] = 1441.0
 
     response = flask_app.test_client().get("/api/health")
 
@@ -1214,6 +1690,168 @@ def test_health_endpoint_warns_about_long_running_measurement(tmp_path):
     assert measurement["active"] is True
     assert measurement["long_running"] is True
     assert "owner_id" not in measurement
+
+
+def test_health_endpoint_reports_cancel_callback_failure_as_degraded(tmp_path):
+    config_path = write_config(tmp_path)
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n[network_probe]\nENABLED=false\nPORT=5201\n")
+    now = [0.0]
+    gate = NetworkMeasurementGate(
+        clock=lambda: now[0],
+        max_hold_seconds={"test": 1.0},
+    )
+    flask_app = create_app(config_path, measurement_gate=gate)
+
+    def fail_cancel():
+        gate.release("test", "active")
+        raise OSError("result persistence failed")
+
+    assert gate.acquire("test", "active", cancel_callback=fail_cancel) is True
+    now[0] = 1.1
+
+    response = flask_app.test_client().get("/api/health")
+
+    measurement = response.json["checks"]["measurement"]
+    assert response.status_code == 200
+    assert response.json["status"] == "degraded"
+    assert measurement["status"] == "degraded"
+    assert measurement["active"] is False
+    assert measurement["cancel_callback_failure_count"] == 1
+    summary = flask_app.test_client().get("/api/operations-summary")
+    assert summary.json["current"]["measurement_cancel_callback_failures"] == 1
+
+
+def test_quick_upload_result_write_failure_returns_500_and_degrades_health(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setattr(app_module, "MEGABYTE", 1)
+    logger = logging.getLogger("test.quick.primary-write")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    flask_app = create_app(
+        write_config(tmp_path),
+        diagnostic_logger=logger,
+    )
+    client = flask_app.test_client()
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("sensitive customer path")
+
+    monkeypatch.setattr(app_module, "append_network_check_log", fail_write)
+
+    started = client.post("/network-check/upload/start?size_mb=10")
+    session_id = started.json["session_id"]
+    chunk = client.post(
+        f"/network-check/upload/chunk/{session_id}",
+        data=b"x" * 10,
+        content_type="application/octet-stream",
+    )
+    finished = client.post(
+        f"/network-check/upload/finish/{session_id}"
+    )
+
+    assert started.status_code == 200
+    assert chunk.status_code == 200
+    assert finished.status_code == 500
+    assert finished.json["status"] == "failure"
+    assert "RESULT_WRITE_FAILED" in finished.json["error"]
+    assert flask_app.extensions["network_measurement_gate"].is_available()
+    health = client.get("/api/health").json
+    background = health["checks"]["background_tasks"]
+    assert background["status"] == "degraded"
+    assert background["components"]["http_quick"] == 1
+    assert "http_quick_result_persistence_failed error_type=OSError" in caplog.text
+    assert "sensitive customer path" not in caplog.text
+
+
+def test_quick_upload_expiry_failure_records_safe_background_event(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setattr(app_module, "MEGABYTE", 1)
+    clock = FakeMonotonicClock()
+    logger = logging.getLogger("test.quick.expiry")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    flask_app = create_app(
+        write_config(tmp_path),
+        diagnostic_logger=logger,
+        network_check_clock=clock,
+    )
+    client = flask_app.test_client()
+    started = client.post("/network-check/upload/start?size_mb=10")
+    session_id = started.json["session_id"]
+
+    def fail_payload(*_args, **_kwargs):
+        raise RuntimeError("sensitive customer expiry detail")
+
+    monkeypatch.setattr(
+        app_module,
+        "build_network_check_response_payload",
+        fail_payload,
+    )
+    clock.advance(app_module.NETWORK_CHECK_UPLOAD_SESSION_TTL_SECONDS)
+
+    flask_app.extensions["network_check_upload_expire"](session_id)
+
+    assert flask_app.extensions["network_measurement_gate"].is_available()
+    health = client.get("/api/health").json
+    assert (
+        health["checks"]["background_tasks"]["components"]["http_quick"]
+        == 1
+    )
+    assert (
+        "network_check_upload_expiry_record_failed error_type=RuntimeError"
+        in caplog.text
+    )
+    assert "sensitive customer expiry detail" not in caplog.text
+
+
+def test_quick_upload_archive_failure_keeps_result_and_degrades_health(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setattr(app_module, "MEGABYTE", 1)
+    logger = logging.getLogger("test.quick.archive")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    flask_app = create_app(
+        write_config(tmp_path),
+        diagnostic_logger=logger,
+    )
+    client = flask_app.test_client()
+    config = load_config(write_config(tmp_path))
+
+    def fail_archive(*_args, **_kwargs):
+        raise OSError("sensitive archive path")
+
+    monkeypatch.setattr(app_module, "archive_csv_history", fail_archive)
+
+    started = client.post("/network-check/upload/start?size_mb=10")
+    session_id = started.json["session_id"]
+    chunk = client.post(
+        f"/network-check/upload/chunk/{session_id}",
+        data=b"x" * 10,
+        content_type="application/octet-stream",
+    )
+    finished = client.post(
+        f"/network-check/upload/finish/{session_id}"
+    )
+
+    assert chunk.status_code == 200
+    assert finished.status_code == 200
+    assert finished.json["status"] == "success"
+    assert read_network_check_log(config)[0]["status"] == "success"
+    health = client.get("/api/health").json
+    assert health["status"] == "degraded"
+    assert (
+        health["checks"]["background_tasks"]["components"]["http_quick"]
+        == 1
+    )
+    assert "http_quick_csv_archive_failed error_type=OSError" in caplog.text
+    assert "sensitive archive path" not in caplog.text
 
 
 def test_health_endpoint_caches_disk_and_csv_checks_for_five_seconds(
@@ -1290,7 +1928,8 @@ def test_release_zip_verifier_accepts_expected_structure(tmp_path):
         "사내 업로드 v0.1.0 Windows 실행 ZIP", encoding="utf-8"
     )
     (package_root / "start_internal_upload.cmd").write_text(
-        "실제 접속 주소를 표시하고 config.ini에 저장합니다.\nInternalUploadServer.exe",
+        "@echo off\nchcp 65001 >nul\n실제 접속 주소를 표시하고 "
+        "config.ini에 저장합니다.\nInternalUploadServer.exe",
         encoding="utf-8",
     )
     (package_root / "config.ini").write_text(
@@ -1325,6 +1964,17 @@ def test_release_zip_verifier_accepts_expected_structure(tmp_path):
     errors = verify_zip(str(tampered_path), "v0.1.0")
     assert any("security manifest hash mismatch: _internal/runtime.dll" in error for error in errors)
     assert any("SHA256SUMS.txt hash mismatch: _internal/runtime.dll" in error for error in errors)
+
+    bom_launcher_path = tmp_path / "bom-launcher.zip"
+    with ZipFile(zip_path) as original, ZipFile(bom_launcher_path, "w") as tampered:
+        for item in original.infolist():
+            content = original.read(item.filename)
+            if item.filename == "start_internal_upload.cmd":
+                content = b"\xef\xbb\xbf" + content
+            tampered.writestr(item, content)
+
+    errors = verify_zip(str(bom_launcher_path), "v0.1.0")
+    assert any("must not start with a UTF-8 BOM" in error for error in errors)
 
 
 def test_release_zip_verifier_rejects_unsafe_and_duplicate_windows_paths(tmp_path):

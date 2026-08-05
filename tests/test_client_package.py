@@ -8,6 +8,7 @@ from zipfile import ZipFile
 import pytest
 
 from app_version import APP_VERSION
+import network_probe.client_package as client_package_module
 from network_probe.client_package import (
     ClientPackageError,
     build_client_package,
@@ -182,3 +183,28 @@ def test_build_client_package_rejects_additional_internal_executable(tmp_path):
 
     with pytest.raises(ClientPackageError, match="추가 실행 파일"):
         build_client_package(bundle, "http://server-pc:8000")
+
+
+def test_client_package_zip_io_failures_do_not_expose_raw_exception(
+    tmp_path,
+    monkeypatch,
+):
+    bundle = make_client_bundle(tmp_path)
+
+    def fail_zip(*args, **kwargs):
+        raise OSError(r"C:\private-customer\zip-detail")
+
+    monkeypatch.setattr(client_package_module, "ZipFile", fail_zip)
+
+    errors = verify_client_package(b"not-used", "http://server-pc:8000")
+    assert errors == [
+        "클라이언트 ZIP을 확인할 수 없습니다. 오류 코드: "
+        "CLIENT_PACKAGE_VERIFY_FAILED."
+    ]
+    assert "private-customer" not in errors[0]
+
+    with pytest.raises(ClientPackageError) as exc_info:
+        build_client_package(bundle, "http://server-pc:8000")
+    message = str(exc_info.value)
+    assert "CLIENT_PACKAGE_BUILD_FAILED" in message
+    assert "private-customer" not in message

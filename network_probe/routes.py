@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import threading
 from pathlib import Path
 from typing import Any, Callable
@@ -23,6 +24,10 @@ from .excel import (
 from .service import ProbeService, ProbeServiceError
 
 
+PROBE_JSON_MAX_BYTES = 64 * 1024
+PROBE_JSON_READ_CHUNK_BYTES = 8 * 1024
+
+
 def _default_lan_ip() -> str:
     return "127.0.0.1"
 
@@ -42,6 +47,12 @@ def create_probe_blueprint(
         if client_bundle_path is not None
         else runtime_client_bundle()
     )
+
+    @blueprint.after_request
+    def disable_sensitive_response_caching(response):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     def client_ip() -> str:
         return service.normalize_ip(request.remote_addr)
@@ -63,7 +74,37 @@ def create_probe_blueprint(
         return jsonify({"error": str(exc)}), exc.status_code
 
     def payload() -> dict[str, Any]:
-        value = request.get_json(silent=True)
+        content_length = request.content_length
+        if content_length is not None and content_length > PROBE_JSON_MAX_BYTES:
+            raise ProbeServiceError(
+                "TCP 측정 JSON 요청 본문은 64 KiB를 초과할 수 없습니다.",
+                413,
+            )
+
+        raw_body = bytearray()
+        while True:
+            remaining = PROBE_JSON_MAX_BYTES + 1 - len(raw_body)
+            if remaining <= 0:
+                raise ProbeServiceError(
+                    "TCP 측정 JSON 요청 본문은 64 KiB를 초과할 수 없습니다.",
+                    413,
+                )
+            chunk = request.stream.read(min(PROBE_JSON_READ_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            raw_body.extend(chunk)
+            if len(raw_body) > PROBE_JSON_MAX_BYTES:
+                raise ProbeServiceError(
+                    "TCP 측정 JSON 요청 본문은 64 KiB를 초과할 수 없습니다.",
+                    413,
+                )
+
+        if not raw_body or not request.is_json:
+            return {}
+        try:
+            value = json.loads(bytes(raw_body))
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            return {}
         return value if isinstance(value, dict) else {}
 
     def package_context() -> tuple[Path, str]:
@@ -170,8 +211,8 @@ def create_probe_blueprint(
 
     @blueprint.post("/sessions")
     def create_session():
-        value = payload()
         try:
+            value = payload()
             result = service.create_session(
                 agent_id=str(value.get("agent_id", "")),
                 direction=str(value.get("direction", "")),
@@ -208,9 +249,9 @@ def create_probe_blueprint(
 
     @blueprint.post("/sessions/<session_id>/complete")
     def complete_phase(session_id: str):
-        value = payload()
-        agent_id = str(value.get("agent_id", ""))
         try:
+            value = payload()
+            agent_id = str(value.get("agent_id", ""))
             return jsonify(
                 service.complete_agent_phase(session_id, agent_id, bearer_token(), client_ip(), value)
             )
@@ -220,11 +261,11 @@ def create_probe_blueprint(
     @blueprint.get("/results/<session_id>.json")
     def result_json(session_id: str):
         try:
-            path = service.result_path_for(session_id)
+            result_text = service.result_text_for(session_id)
         except ProbeServiceError as exc:
             return error_response(exc)
         return Response(
-            path.read_text(encoding="utf-8"),
+            result_text,
             mimetype="application/json",
             headers={"Content-Disposition": f'attachment; filename="network-probe-{session_id}.json"'},
         )

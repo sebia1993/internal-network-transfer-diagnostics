@@ -11,6 +11,9 @@ from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
 WEB_MAX_REQUEST_THREADS = 32
 WEB_REQUEST_TIMEOUT_SECONDS = 30.0
 WEB_SHUTDOWN_DRAIN_SECONDS = 30.0
+WEB_FORCE_CLOSE_GRACE_SECONDS = 2.0
+WEB_REJECT_DRAIN_SECONDS = 0.25
+WEB_REJECT_DRAIN_MAX_BYTES = 64 * 1024
 
 
 class BoundedWSGIRequestHandler(WSGIRequestHandler):
@@ -37,6 +40,8 @@ class BoundedThreadedWSGIServer(ThreadedWSGIServer):
         self._request_state_lock = threading.Lock()
         self._request_state_changed = threading.Condition(self._request_state_lock)
         self._active_request_count = 0
+        self._active_requests: set[socket.socket] = set()
+        self._force_closed_requests: set[socket.socket] = set()
         self._rejected_request_count = 0
         self._draining = False
         super().__init__(host, port, app, handler=BoundedWSGIRequestHandler)
@@ -85,26 +90,47 @@ class BoundedThreadedWSGIServer(ThreadedWSGIServer):
                 reject_reason = "capacity"
             else:
                 self._active_request_count += 1
+                self._active_requests.add(request)
         if reject_reason:
             self._reject_request(request, reason=reject_reason)
             return
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self._release_request_slot()
+            self._release_request_slot(request)
             raise
 
     def process_request_thread(self, request, client_address) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._release_request_slot()
+            self._release_request_slot(request)
 
-    def _release_request_slot(self) -> None:
+    def _release_request_slot(self, request: socket.socket) -> None:
         with self._request_state_changed:
             self._active_request_count = max(self._active_request_count - 1, 0)
+            self._active_requests.discard(request)
+            self._force_closed_requests.discard(request)
             self._request_state_changed.notify_all()
         self._request_slots.release()
+
+    def force_close_active_requests(self) -> int:
+        with self._request_state_changed:
+            requests = list(self._active_requests)
+            self._force_closed_requests.update(requests)
+        for request in requests:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return len(requests)
+
+    def handle_error(self, request, client_address) -> None:
+        with self._request_state_lock:
+            expected_force_close = request in self._force_closed_requests
+        if expected_force_close:
+            return
+        super().handle_error(request, client_address)
 
     def _reject_request(self, request: socket.socket, *, reason: str) -> None:
         if reason == "shutdown":
@@ -121,13 +147,41 @@ class BoundedThreadedWSGIServer(ThreadedWSGIServer):
             + f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
             + payload
         )
+        response_sent = False
         try:
             request.settimeout(1.0)
             request.sendall(response)
+            response_sent = True
         except OSError:
             pass
         finally:
-            self.shutdown_request(request)
+            try:
+                request.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            if response_sent:
+                deadline = time.monotonic() + WEB_REJECT_DRAIN_SECONDS
+                drained_bytes = 0
+                while (
+                    drained_bytes < WEB_REJECT_DRAIN_MAX_BYTES
+                    and time.monotonic() < deadline
+                ):
+                    try:
+                        request.settimeout(
+                            max(deadline - time.monotonic(), 0.001)
+                        )
+                        chunk = request.recv(
+                            min(
+                                4096,
+                                WEB_REJECT_DRAIN_MAX_BYTES - drained_bytes,
+                            )
+                        )
+                    except (OSError, TimeoutError):
+                        break
+                    if not chunk:
+                        break
+                    drained_bytes += len(chunk)
+            self.close_request(request)
 
 
 def make_bounded_server(

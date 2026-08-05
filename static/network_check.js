@@ -6,19 +6,95 @@
     const buttons = document.querySelectorAll("[data-tab-button]");
     const panels = document.querySelectorAll("[data-tab-panel]");
 
+    function activateTab(button) {
+      const targetId = button.dataset.tabButton;
+      buttons.forEach((item) => {
+        const active = item === button;
+        item.classList.toggle("is-active", active);
+        item.setAttribute("aria-selected", active ? "true" : "false");
+        item.tabIndex = active ? 0 : -1;
+      });
+      panels.forEach((panel) => {
+        const active = panel.id === targetId;
+        panel.classList.toggle("is-active", active);
+        panel.hidden = !active;
+      });
+    }
+
     buttons.forEach((button) => {
-      button.addEventListener("click", () => {
-        const targetId = button.dataset.tabButton;
-        buttons.forEach((item) => {
-          item.classList.toggle("is-active", item === button);
-        });
-        panels.forEach((panel) => {
-          const active = panel.id === targetId;
-          panel.classList.toggle("is-active", active);
-          panel.hidden = !active;
-        });
+      button.addEventListener("click", () => activateTab(button));
+    });
+  }
+
+  function initTabKeyboardNavigation() {
+    document.querySelectorAll('[role="tablist"]').forEach((tablist) => {
+      tablist.addEventListener("keydown", (event) => {
+        if (!event.target.matches('[role="tab"]')) {
+          return;
+        }
+        const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'))
+          .filter((tab) => !tab.disabled);
+        const currentIndex = tabs.indexOf(event.target);
+        if (currentIndex < 0) {
+          return;
+        }
+        let nextIndex = currentIndex;
+        if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+          nextIndex = (currentIndex + 1) % tabs.length;
+        } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+          nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+        } else if (event.key === "Home") {
+          nextIndex = 0;
+        } else if (event.key === "End") {
+          nextIndex = tabs.length - 1;
+        } else {
+          return;
+        }
+        event.preventDefault();
+        tabs[nextIndex].focus();
+        tabs[nextIndex].click();
       });
     });
+  }
+
+  function setOperationState(element, state) {
+    element.classList.remove("is-idle", "is-running", "is-success", "is-warning", "is-error");
+    element.classList.add(`is-${state}`);
+    element.dataset.state = state;
+  }
+
+  function initUploadForm() {
+    const form = document.querySelector("[data-upload-form]");
+    if (!form) {
+      return;
+    }
+    const submitButton = form.querySelector("[data-upload-submit]");
+    const submitStatus = form.querySelector("[data-upload-submit-status]");
+    const defaultButtonText = submitButton.textContent;
+    let submitting = false;
+
+    function resetSubmissionState() {
+      submitting = false;
+      form.setAttribute("aria-busy", "false");
+      submitButton.disabled = false;
+      submitButton.textContent = defaultButtonText;
+      submitStatus.textContent = "대기 · 파일을 선택한 뒤 업로드를 누르세요.";
+      setOperationState(submitStatus, "idle");
+    }
+
+    form.addEventListener("submit", (event) => {
+      if (submitting) {
+        event.preventDefault();
+        return;
+      }
+      submitting = true;
+      form.setAttribute("aria-busy", "true");
+      submitButton.disabled = true;
+      submitButton.textContent = "업로드 중…";
+      submitStatus.textContent = "진행 중 · 업로드가 끝날 때까지 창을 닫거나 다시 누르지 마세요.";
+      setOperationState(submitStatus, "running");
+    });
+    window.addEventListener("pageshow", resetSubmissionState);
   }
 
   function formatSpeed(mbps) {
@@ -85,11 +161,14 @@
     const cancelButton = root.querySelector("[data-cancel-check]");
     const statusText = root.querySelector("[data-network-status]");
     const progressBar = root.querySelector("[data-progress-bar]");
+    const progressTrack = progressBar.closest('[role="progressbar"]');
     const progressText = root.querySelector("[data-progress-text]");
     const averageSpeed = root.querySelector("[data-average-speed]");
     const intervalSpeed = root.querySelector("[data-interval-speed]");
     const summary = root.querySelector("[data-summary]");
     const resultList = root.querySelector("[data-result-list]");
+    const guidance = root.querySelector("[data-network-guidance]");
+    const resultPanel = statusText.closest("[data-http-criterion-result]");
     const measurementModeButtons = root.querySelectorAll("[data-measurement-mode]");
     const criterionButtons = root.querySelectorAll("[data-http-criterion]");
 
@@ -113,16 +192,41 @@
         button.disabled = nextRunning;
       });
       root.dataset.simpleRunning = nextRunning ? "true" : "";
+      resultPanel.setAttribute("aria-busy", nextRunning ? "true" : "false");
     }
 
-    function setStatus(message) {
+    function setStatus(message, state, guidanceMessage) {
+      const operationState = state || "idle";
       statusText.textContent = message;
+      statusText.setAttribute("aria-live", operationState === "error" ? "assertive" : "polite");
+      setOperationState(statusText, operationState);
+      const guidanceByState = {
+        idle: "대기 · 측정 종류와 데이터량을 선택한 뒤 측정을 시작하세요.",
+        running: "진행 중 · 완료되거나 취소될 때까지 중복 실행할 수 없습니다.",
+        success: "정상 완료 · 측정값을 확인하세요. 완료 표시는 네트워크 정상 판정이 아닙니다.",
+        warning: "주의 · 측정이 취소되었습니다. 필요하면 동일 조건으로 다시 시작하세요.",
+        error: "장애 · 오류 내용을 확인하고 서버 주소, 방화벽, 연결 상태를 점검한 뒤 다시 시도하세요.",
+      };
+      guidance.textContent = guidanceMessage || guidanceByState[operationState];
+      guidance.setAttribute("aria-live", operationState === "error" ? "assertive" : "polite");
+      setOperationState(guidance, operationState);
+      progressTrack.dataset.state = operationState;
+    }
+
+    function updateProgressAccessibility(percent, label) {
+      const boundedPercent = Math.min(100, Math.max(0, Number(percent) || 0));
+      progressTrack.setAttribute("aria-valuenow", boundedPercent.toFixed(1));
+      progressTrack.setAttribute(
+        "aria-valuetext",
+        `${label || statusText.textContent} · ${boundedPercent.toFixed(1)}%`
+      );
     }
 
     function resetProgress(message) {
-      setStatus(message);
+      setStatus(message, "running");
       progressBar.style.width = "0%";
       progressText.textContent = "0%";
+      updateProgressAccessibility(0, message);
       averageSpeed.textContent = "-";
       intervalSpeed.textContent = "-";
       summary.textContent = "-";
@@ -140,6 +244,7 @@
       const intervalMbps = (intervalBytes * 8) / intervalSeconds / 1_000_000;
       progressBar.style.width = `${percent.toFixed(1)}%`;
       progressText.textContent = `${percent.toFixed(1)}%`;
+      updateProgressAccessibility(percent);
       averageSpeed.textContent = formatSpeed(averageMbps);
       intervalSpeed.textContent = formatSpeed(intervalMbps);
       lastProgressBytes = bytesDone;
@@ -191,6 +296,23 @@
         resultList.appendChild(item);
       });
       summary.textContent = `${results.map((result) => result.label).join("·")} 측정 완료`;
+    }
+
+    function renderPartialResults(results, action, errorMessage, cancelled) {
+      renderResults(results);
+      const completedLabels = new Set(results.map((result) => result.label));
+      let retryLabel = action === "upload" ? "업로드" : "다운로드";
+      if (action === "full") {
+        retryLabel = completedLabels.has("업로드") ? "다운로드" : "업로드";
+      }
+      const completedText = Array.from(completedLabels).join("·");
+      setStatus(
+        "부분 완료",
+        "warning",
+        `주의 · ${completedText} 결과는 보존했습니다. 연결 상태를 확인한 뒤 ${retryLabel} 측정만 다시 실행하세요.`
+      );
+      summary.setAttribute("aria-live", "assertive");
+      summary.textContent = `부분 완료 · ${completedText} 측정 성공 · ${retryLabel} 측정 ${cancelled ? "중단" : "실패"}: ${errorMessage}`;
     }
 
     function makeUploadChunk() {
@@ -311,6 +433,11 @@
           { method: "POST", cache: "no-store", signal },
           "업로드 완료"
         );
+        if (finished.status !== "success") {
+          throw new Error(
+            finished.error || "업로드 측정 결과를 저장하지 못했습니다."
+          );
+        }
         updateProgress(totalBytes, totalBytes, startedAt);
         return {
           label: "업로드",
@@ -331,7 +458,11 @@
     }
 
     async function runAction(action) {
-      if (running) {
+      if (
+        running ||
+        root.dataset.sustainedRunning === "true" ||
+        root.dataset.probeRunning === "true"
+      ) {
         return;
       }
 
@@ -341,6 +472,7 @@
       }
 
       const results = [];
+      resultList.innerHTML = "";
       activeController = new AbortController();
       setRunning(true);
 
@@ -351,11 +483,18 @@
         if (action === "download" || action === "full") {
           results.push(await runDownload(sizeMb, activeController.signal));
         }
-        setStatus("완료");
+        setStatus("완료", "success");
         renderResults(results);
       } catch (error) {
-        setStatus(error.message === "측정이 취소되었습니다." ? "취소됨" : "실패");
-        summary.textContent = error.message || "측정 중 오류가 발생했습니다.";
+        const cancelled = error.message === "측정이 취소되었습니다.";
+        const errorMessage = error.message || "측정 중 오류가 발생했습니다.";
+        if (results.length > 0) {
+          renderPartialResults(results, action, errorMessage, cancelled);
+        } else {
+          setStatus(cancelled ? "취소됨" : "실패", cancelled ? "warning" : "error");
+          summary.setAttribute("aria-live", cancelled ? "polite" : "assertive");
+          summary.textContent = errorMessage;
+        }
       } finally {
         activeController = null;
         setRunning(false);
@@ -375,6 +514,8 @@
     });
   }
 
+  initUploadForm();
   initTabs();
+  initTabKeyboardNavigation();
   initNetworkCheck();
 })();

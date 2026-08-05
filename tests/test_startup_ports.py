@@ -9,6 +9,7 @@ import app as app_module
 import startup_ports as ports_module
 from runtime_stability import DataDirectoryLock
 from startup_ports import (
+    ConfigFileError,
     CURRENT_CONFIG_VERSION,
     FIREWALL_NOT_APPLICABLE,
     FIREWALL_UNKNOWN,
@@ -351,6 +352,67 @@ class FakeWebServer:
         self.events.append("close")
 
 
+class StuckFakeWebServer(FakeWebServer):
+    def __init__(self, events):
+        super().__init__(events)
+        self.wait_calls = 0
+        self._active_request_count = 1
+
+    def wait_for_active_requests(self, timeout_seconds):
+        self.wait_calls += 1
+        if self.wait_calls == 1:
+            assert timeout_seconds == app_module.WEB_SHUTDOWN_DRAIN_SECONDS
+            self.events.append("drain-wait")
+            return False
+        assert timeout_seconds == app_module.WEB_FORCE_CLOSE_GRACE_SECONDS
+        self.events.append("force-wait")
+        self._active_request_count = 0
+        return True
+
+    def force_close_active_requests(self):
+        self.events.append("force-close")
+        return self._active_request_count
+
+    @property
+    def active_request_count(self):
+        return self._active_request_count
+
+
+class PermanentlyStuckFakeWebServer(FakeWebServer):
+    def wait_for_active_requests(self, timeout_seconds):
+        self.events.append(("wait", timeout_seconds))
+        return False
+
+    def force_close_active_requests(self):
+        self.events.append("force-close")
+        return 1
+
+    @property
+    def active_request_count(self):
+        return 1
+
+
+def test_main_returns_failure_when_web_port_change_is_declined(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    path = write_config(tmp_path)
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PortChangeDeclined("사용자가 웹 포트 변경을 취소했습니다.")
+        ),
+    )
+
+    assert app_module.main(["--config", str(path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "WEB_PORT_CHANGE_DECLINED" in captured.err
+    assert "서버를 시작하지 않았습니다" in captured.err
+
+
 def test_main_binds_selected_port_before_persisting_config(tmp_path, monkeypatch):
     path = write_config(tmp_path, base_url="http://files.local:8000")
     events = []
@@ -387,14 +449,273 @@ def test_main_binds_selected_port_before_persisting_config(tmp_path, monkeypatch
     ]
 
 
-def test_main_bind_failure_does_not_change_config(tmp_path, monkeypatch):
+def test_main_force_closes_requests_that_exceed_shutdown_drain(
+    tmp_path,
+    monkeypatch,
+):
+    path = write_config(tmp_path)
+    events = []
+    server = StuckFakeWebServer(events)
+
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: PortResolution(8000, 8000),
+    )
+    monkeypatch.setattr(app_module, "make_server", lambda *args, **kwargs: server)
+    monkeypatch.setattr(
+        app_module,
+        "print_server_addresses",
+        lambda config: events.append("addresses"),
+    )
+
+    assert app_module.main(["--config", str(path)]) == 0
+    assert events == [
+        "addresses",
+        "serve",
+        "drain-start",
+        "drain-wait",
+        "force-close",
+        "force-wait",
+        "close",
+    ]
+
+
+def test_main_hard_exits_without_releasing_data_lock_when_handler_stays_alive(
+    tmp_path,
+    monkeypatch,
+):
+    path = write_config(tmp_path)
+    events = []
+    server = PermanentlyStuckFakeWebServer(events)
+
+    class ForcedExit(RuntimeError):
+        pass
+
+    class FakeDataDirectoryLock:
+        def __init__(self, _path):
+            events.append("lock-created")
+
+        def acquire(self):
+            events.append("lock-acquired")
+
+        def release(self):
+            events.append("lock-released")
+
+    def fake_hard_exit(exit_code):
+        events.append(("hard-exit", exit_code))
+        raise ForcedExit
+
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: PortResolution(8000, 8000),
+    )
+    monkeypatch.setattr(app_module, "DataDirectoryLock", FakeDataDirectoryLock)
+    monkeypatch.setattr(app_module, "make_server", lambda *args, **kwargs: server)
+    monkeypatch.setattr(app_module, "print_server_addresses", lambda config: None)
+    monkeypatch.setattr(app_module, "hard_exit_process", fake_hard_exit)
+
+    with pytest.raises(ForcedExit):
+        app_module.main(["--config", str(path)])
+
+    assert ("hard-exit", 2) in events
+    assert "lock-released" not in events
+    assert "close" not in events
+
+
+def test_main_reports_corrupt_upload_transaction_without_traceback(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    path = write_config(tmp_path)
+    config = app_module.load_config(path)
+    transaction_root = config.log_path.parent / "upload_transactions"
+    transaction_root.mkdir(parents=True)
+    (transaction_root / "broken.json").write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: PortResolution(8000, 8000),
+    )
+
+    assert app_module.main(["--config", str(path)]) == 2
+
+    error_output = capsys.readouterr().err
+    assert "업로드 복구 기록이 손상" in error_output
+    assert "Traceback" not in error_output
+    assert "{not-json" not in error_output
+    assert "broken.json" not in error_output
+    diagnostic_log = (
+        config.log_path.parent / "diagnostics" / "internal-upload.log"
+    ).read_text(encoding="utf-8")
+    assert "startup_upload_transaction_recovery_failed" in diagnostic_log
+    assert "{not-json" not in diagnostic_log
+
+
+def test_main_reports_corrupt_measurement_transaction_without_traceback(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    path = write_config(tmp_path)
+    config = app_module.load_config(path)
+    app_module.ensure_directories(config)
+    transaction_root = (
+        config.log_path.parent
+        / "measurement_transactions"
+        / "http_sustained"
+    )
+    transaction_root.mkdir(parents=True)
+    (transaction_root / "broken.json").write_text(
+        "{private-not-json",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: PortResolution(8000, 8000),
+    )
+
+    assert app_module.main(["--config", str(path)]) == 2
+
+    error_output = capsys.readouterr().err
+    assert "MEASUREMENT_RECOVERY_FAILED" in error_output
+    assert "Traceback" not in error_output
+    assert "private-not-json" not in error_output
+    assert "broken.json" not in error_output
+    diagnostic_log = (
+        config.log_path.parent / "diagnostics" / "internal-upload.log"
+    ).read_text(encoding="utf-8")
+    assert "startup_measurement_transaction_recovery_failed" in diagnostic_log
+    assert "private-not-json" not in diagnostic_log
+
+
+def test_main_bind_failure_does_not_change_config(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
     path = write_config(tmp_path)
     original = path.read_bytes()
     monkeypatch.setattr(app_module, "resolve_startup_port", lambda *args, **kwargs: PortResolution(8000, 8001))
-    monkeypatch.setattr(app_module, "make_server", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("taken")))
+    monkeypatch.setattr(
+        app_module,
+        "make_server",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError(r"C:\private-customer\bind-detail")
+        ),
+    )
 
     assert app_module.main(["--config", str(path)]) == 2
     assert path.read_bytes() == original
+    error_output = capsys.readouterr().err
+    assert "WEB_BIND_FAILED" in error_output
+    assert "private-customer" not in error_output
+    assert "Traceback" not in error_output
+
+    diagnostic_log = (
+        tmp_path / "data" / "diagnostics" / "internal-upload.log"
+    ).read_text(encoding="utf-8")
+    assert "web_server_bind_failed error_type=OSError" in diagnostic_log
+    assert "private-customer" not in diagnostic_log
+
+
+def test_main_reports_diagnostic_log_init_failure_without_exception_or_path(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    path = write_config(tmp_path)
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: PortResolution(8000, 8000),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "configure_diagnostic_logger",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PermissionError(r"C:\private-customer\diagnostics")
+        ),
+    )
+
+    assert app_module.main(["--config", str(path)]) == 2
+
+    error_output = capsys.readouterr().err
+    assert "DIAGNOSTIC_LOG_INIT_FAILED" in error_output
+    assert "private-customer" not in error_output
+    assert "Traceback" not in error_output
+
+    lock = DataDirectoryLock(
+        tmp_path / "data" / ".internal-upload.instance.lock"
+    )
+    lock.acquire()
+    lock.release()
+
+
+def test_main_web_port_persist_failure_is_sanitized_and_closes_server(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    path = write_config(tmp_path)
+    original = path.read_bytes()
+    events = []
+    server = FakeWebServer(events)
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: PortResolution(8000, 8001),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "make_server",
+        lambda *args, **kwargs: server,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "persist_port_change",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PermissionError(r"C:\private-customer\config.ini")
+        ),
+    )
+
+    assert app_module.main(["--config", str(path)]) == 2
+
+    assert path.read_bytes() == original
+    assert "close" in events
+    error_output = capsys.readouterr().err
+    assert "WEB_PORT_CONFIG_WRITE_FAILED" in error_output
+    assert "private-customer" not in error_output
+    assert "Traceback" not in error_output
+    diagnostic_log = (
+        tmp_path / "data" / "diagnostics" / "internal-upload.log"
+    ).read_text(encoding="utf-8")
+    assert "web_port_config_write_failed error_type=PermissionError" in diagnostic_log
+    assert "private-customer" not in diagnostic_log
+
+
+def test_main_reports_config_path_resolution_failure_without_traceback(
+    monkeypatch,
+    capsys,
+):
+    class FailingPath:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def resolve(self):
+            raise OSError(r"C:\private-customer\config.ini")
+
+    monkeypatch.setattr(app_module, "Path", FailingPath)
+
+    assert app_module.main(["--config", "config.ini"]) == 2
+
+    error_output = capsys.readouterr().err
+    assert "CONFIG_PATH_INVALID" in error_output
+    assert "private-customer" not in error_output
+    assert "Traceback" not in error_output
 
 
 def test_main_existing_instance_exits_without_binding(tmp_path, monkeypatch):
@@ -507,6 +828,67 @@ def test_main_starts_probe_on_approved_fallback_then_persists_port(tmp_path, mon
     ]
 
 
+def test_main_probe_port_persist_failure_is_sanitized_and_continues(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    path = write_config(tmp_path, probe_enabled=True)
+    events = []
+
+    class FakeProbeService:
+        def __init__(self, *, config, measurement_gate, normalize_ip):
+            self.config = config
+            self.start_error = ""
+
+        def start(self):
+            events.append(("probe-start", self.config.port))
+            return True
+
+        def stop(self):
+            events.append("probe-stop")
+
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: PortResolution(8000, 8000),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "resolve_probe_port",
+        lambda *args, **kwargs: PortResolution(5201, 5202),
+    )
+    monkeypatch.setattr(app_module, "ProbeService", FakeProbeService)
+    monkeypatch.setattr(
+        app_module,
+        "make_server",
+        lambda *args, **kwargs: FakeWebServer(events),
+    )
+    monkeypatch.setattr(app_module, "print_firewall_status", lambda *args: None)
+    monkeypatch.setattr(app_module, "print_server_addresses", lambda *args: None)
+    monkeypatch.setattr(
+        app_module,
+        "persist_probe_port_change",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PermissionError(r"C:\private-customer\config.ini")
+        ),
+    )
+
+    assert app_module.main(["--config", str(path)]) == 0
+
+    assert read_config(path).getint("network_probe", "PORT") == 5201
+    assert "serve" in events
+    error_output = capsys.readouterr().err
+    assert "PROBE_PORT_CONFIG_WRITE_FAILED" in error_output
+    assert "private-customer" not in error_output
+    assert "Traceback" not in error_output
+    diagnostic_log = (
+        tmp_path / "data" / "diagnostics" / "internal-upload.log"
+    ).read_text(encoding="utf-8")
+    assert "probe_port_config_write_failed error_type=PermissionError" in diagnostic_log
+    assert "private-customer" not in diagnostic_log
+
+
 def test_main_keeps_web_server_running_when_probe_port_change_is_declined(tmp_path, monkeypatch):
     path = write_config(tmp_path, probe_enabled=True)
     events = []
@@ -551,7 +933,11 @@ def test_main_keeps_web_server_running_when_probe_port_change_is_declined(tmp_pa
     ]
 
 
-def test_main_keeps_migrated_probe_enabled_when_config_write_fails(tmp_path, monkeypatch):
+def test_main_keeps_migrated_probe_enabled_when_config_write_fails(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
     path = write_config(tmp_path, config_version=None, probe_enabled=False)
     events = []
 
@@ -597,6 +983,13 @@ def test_main_keeps_migrated_probe_enabled_when_config_write_fails(tmp_path, mon
         "probe-stop",
         "close",
     ]
+    error_output = capsys.readouterr().err
+    assert "[app] CONFIG_VERSION" in error_output
+    assert "[network_probe] ENABLED" in error_output
+    assert path.name in error_output
+    assert str(path.resolve()) not in error_output
+    assert "read-only" not in error_output
+    assert "Traceback" not in error_output
 
 
 def test_main_does_not_persist_fallback_probe_port_when_bind_fails(tmp_path, monkeypatch):
@@ -640,3 +1033,206 @@ def test_main_does_not_persist_fallback_probe_port_when_bind_fails(tmp_path, mon
         "probe-stop",
         "close",
     ]
+
+
+@pytest.mark.parametrize(
+    ("old_value", "new_value", "expected_key", "expected_allowed"),
+    [
+        ("PORT=8000", "PORT=not-a-number", "[app] PORT", "1~65535 사이의 정수"),
+        ("PORT=8000", "PORT=0", "[app] PORT", "1~65535 사이의 정수"),
+        ("RECENT_LIMIT=50", "RECENT_LIMIT=0", "[app] RECENT_LIMIT", "1~10000 사이의 정수"),
+        ("RECENT_LIMIT=50", "RECENT_LIMIT=10001", "[app] RECENT_LIMIT", "1~10000 사이의 정수"),
+        ("CONFIG_VERSION=2", "CONFIG_VERSION=3", "[app] CONFIG_VERSION", "0~2 사이의 정수"),
+        ("HOST=0.0.0.0", "HOST=http://host", "[app] HOST", "포트가 없는 호스트 이름"),
+        ("BASE_URL=http://files.local:8000", "BASE_URL=file:///tmp", "[app] BASE_URL", "http(s) URL"),
+        ("STORAGE_ROOT=uploads", "STORAGE_ROOT=   ", "[app] STORAGE_ROOT", "비어 있지 않은 폴더 경로"),
+        (
+            "DELETE_ALLOWED_IPS=127.0.0.1,::1",
+            "DELETE_ALLOWED_IPS=127.0.0.0/8",
+            "[app] DELETE_ALLOWED_IPS",
+            "CIDR 제외",
+        ),
+        (
+            "ENABLED=false",
+            "ENABLED=maybe",
+            "[network_probe] ENABLED",
+            "true/false, yes/no, on/off 또는 1/0",
+        ),
+        ("PORT=5201", "PORT=70000", "[network_probe] PORT", "1~65535 사이의 정수"),
+    ],
+)
+def test_main_rejects_invalid_explicit_config_values_without_fallback(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    old_value,
+    new_value,
+    expected_key,
+    expected_allowed,
+):
+    path = write_config(tmp_path)
+    original = path.read_text(encoding="utf-8")
+    path.write_text(
+        original.replace(old_value, new_value, 1) + "\nPRIVATE_VALUE=do-not-print\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: pytest.fail("must not resolve a port"),
+    )
+
+    assert app_module.main(["--config", str(path)]) == 2
+
+    error_output = capsys.readouterr().err
+    assert expected_key in error_output
+    assert expected_allowed in error_output
+    assert path.name in error_output
+    assert str(path.resolve()) not in error_output
+    assert "do-not-print" not in error_output
+    assert "Traceback" not in error_output
+
+
+def test_load_config_rejects_invalid_explicit_value(tmp_path):
+    path = write_config(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("RECENT_LIMIT=50", "RECENT_LIMIT=invalid"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigFileError, match=r"\[app\] RECENT_LIMIT"):
+        app_module.load_config(path)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "javascript:alert(1)",
+        "http://user:password@files.local:8000",
+        "http://files.local:8000?token=private",
+        "http://files.local:8000#fragment",
+        "http://files.local:not-a-port",
+    ],
+)
+def test_load_config_rejects_unsafe_base_url_without_echoing_value(
+    tmp_path,
+    base_url,
+):
+    path = write_config(tmp_path, base_url=base_url)
+
+    with pytest.raises(ConfigFileError) as exc_info:
+        app_module.load_config(path)
+
+    message = str(exc_info.value)
+    assert "[app] BASE_URL" in message
+    assert base_url not in message
+
+
+def test_load_config_rejects_storage_root_that_is_a_file(tmp_path):
+    storage_file = tmp_path / "not-a-folder"
+    storage_file.write_text("private-content", encoding="utf-8")
+    path = write_config(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "STORAGE_ROOT=uploads",
+            "STORAGE_ROOT=not-a-folder",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigFileError) as exc_info:
+        app_module.load_config(path)
+
+    message = str(exc_info.value)
+    assert "[app] STORAGE_ROOT" in message
+    assert "private-content" not in message
+
+
+def test_main_reports_storage_initialization_failure_without_traceback_or_path(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    path = write_config(tmp_path)
+    monkeypatch.setattr(
+        app_module,
+        "resolve_startup_port",
+        lambda *args, **kwargs: PortResolution(8000, 8000),
+    )
+
+    def fail_storage_initialization(_config):
+        raise PermissionError(r"C:\private-customer\denied")
+
+    monkeypatch.setattr(
+        app_module,
+        "ensure_directories",
+        fail_storage_initialization,
+    )
+
+    assert app_module.main(["--config", str(path)]) == 2
+
+    error_output = capsys.readouterr().err
+    assert "STORAGE_INIT_FAILED" in error_output
+    assert "private-customer" not in error_output
+    assert "Traceback" not in error_output
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_text"),
+    [
+        (
+            "[app]\nPORT=8000\n[app]\nPRIVATE_VALUE=do-not-print\n",
+            "설정 파일 형식이 올바르지 않습니다",
+        ),
+        (
+            "PORT=8000\nPRIVATE_VALUE=do-not-print\n",
+            "설정 파일 형식이 올바르지 않습니다",
+        ),
+    ],
+)
+def test_main_rejects_malformed_ini_without_exposing_content(
+    tmp_path,
+    capsys,
+    content,
+    expected_text,
+):
+    path = tmp_path / "config.ini"
+    path.write_text(content, encoding="utf-8")
+
+    assert app_module.main(["--config", str(path)]) == 2
+
+    error_output = capsys.readouterr().err
+    assert expected_text in error_output
+    assert "[app]" in error_output
+    assert "[network_probe]" in error_output
+    assert path.name in error_output
+    assert str(path.resolve()) not in error_output
+    assert "do-not-print" not in error_output
+    assert "Traceback" not in error_output
+
+
+def test_main_rejects_non_utf8_config_without_traceback(tmp_path, capsys):
+    path = tmp_path / "config.ini"
+    path.write_bytes(b"[app]\nPORT=8000\nPRIVATE_VALUE=\xff\xfe\n")
+
+    assert app_module.main(["--config", str(path)]) == 2
+
+    error_output = capsys.readouterr().err
+    assert "허용값: UTF-8" in error_output
+    assert path.name in error_output
+    assert str(path.resolve()) not in error_output
+    assert "Traceback" not in error_output
+
+
+def test_main_reports_config_read_oserror_without_traceback(tmp_path, capsys):
+    config_directory = tmp_path / "config.ini"
+    config_directory.mkdir()
+
+    assert app_module.main(["--config", str(config_directory)]) == 2
+
+    error_output = capsys.readouterr().err
+    assert "설정 파일을 읽을 수 없습니다" in error_output
+    assert "읽기 가능한 UTF-8 INI 파일" in error_output
+    assert config_directory.name in error_output
+    assert str(config_directory.resolve()) not in error_output
+    assert "Traceback" not in error_output

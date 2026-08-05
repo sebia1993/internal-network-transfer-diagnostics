@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import socket
 import statistics
 import threading
@@ -183,6 +184,26 @@ def _stream_result(
 def aggregate_stream_results(results: list[dict[str, Any]], *, role: str, duration_seconds: int) -> dict[str, Any]:
     if not results:
         raise ProbeTransferError("TCP 스트림 결과가 없습니다.")
+    if duration_seconds <= 0:
+        raise ProbeTransferError("TCP 측정 시간이 올바르지 않습니다.")
+
+    validated_results = []
+    for result in results:
+        try:
+            byte_count = int(result.get("bytes", 0))
+            actual_duration = float(result.get("duration_seconds", 0))
+        except (TypeError, ValueError) as exc:
+            raise ProbeTransferError("TCP 스트림 처리량 결과가 올바르지 않습니다.") from exc
+        if byte_count <= 0:
+            raise ProbeTransferError("TCP 스트림에 전송된 데이터가 없습니다.")
+        if not math.isfinite(actual_duration) or actual_duration <= 0:
+            raise ProbeTransferError("TCP 스트림 측정 시간이 올바르지 않습니다.")
+        validated = dict(result)
+        validated["bytes"] = byte_count
+        validated["duration_seconds"] = actual_duration
+        validated_results.append(validated)
+
+    results = validated_results
     total_bytes = sum(int(item.get("bytes", 0)) for item in results)
     interval_bytes = [0] * duration_seconds
     for item in results:

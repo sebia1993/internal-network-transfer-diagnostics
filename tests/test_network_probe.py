@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import errno
 import json
+import logging
 import os
 import socket
 import threading
@@ -11,6 +12,7 @@ import uuid
 
 import pytest
 
+import measurement_transactions as transaction_module
 import network_probe.service as service_module
 from app_version import APP_VERSION
 from network_measurement import NetworkMeasurementGate
@@ -19,7 +21,12 @@ from network_probe.agent import ProbeClientError, connectivity_error_code, norma
 from network_probe.protocol import recv_frame, send_frame
 from network_probe.self_check import run_probe_self_check
 from network_probe.service import ProbeService, ProbeServiceError
-from network_probe.tcp_engine import aggregate_stream_results, run_receiver_stream, run_sender_stream
+from network_probe.tcp_engine import (
+    ProbeTransferError,
+    aggregate_stream_results,
+    run_receiver_stream,
+    run_sender_stream,
+)
 from network_probe.windows_tcp_info import SIO_TCP_INFO, snapshot_tcp_info
 
 
@@ -41,8 +48,13 @@ def build_service(
     max_terminal_sessions: int = 100,
     max_connection_handlers: int = 16,
     clock=time.perf_counter,
+    gate_clock=time.monotonic,
+    gate_max_hold_seconds=None,
 ) -> tuple[ProbeService, NetworkMeasurementGate]:
-    gate = NetworkMeasurementGate()
+    gate = NetworkMeasurementGate(
+        clock=gate_clock,
+        max_hold_seconds=gate_max_hold_seconds,
+    )
     service = ProbeService(
         config=ProbeConfig(
             enabled=enabled,
@@ -189,6 +201,54 @@ def run_client_phase(
     finally:
         for sock in sockets.values():
             sock.close()
+
+
+def build_agent_result(
+    *,
+    stream_count: int,
+    duration_seconds: float = 10.0,
+    zero_stream_id: int | None = None,
+) -> dict:
+    streams = []
+    interval_count = int(max(duration_seconds, 1))
+    for stream_id in range(stream_count):
+        byte_count = 0 if stream_id == zero_stream_id else 1024
+        interval_bytes = [0] * interval_count
+        interval_bytes[0] = byte_count
+        streams.append(
+            {
+                "stream_id": stream_id,
+                "role": "sender",
+                "bytes": byte_count,
+                "duration_seconds": duration_seconds,
+                "interval_bytes": interval_bytes,
+                "telemetry": {"available": False},
+            }
+        )
+    total_bytes = sum(stream["bytes"] for stream in streams)
+    intervals = [
+        {
+            "index": index + 1,
+            "bytes": total_bytes if index == 0 else 0,
+            "mbps": round(
+                (total_bytes if index == 0 else 0) * 8 / 1_000_000,
+                2,
+            ),
+        }
+        for index in range(interval_count)
+    ]
+    return {
+        "role": "sender",
+        "bytes": total_bytes,
+        "duration_seconds": duration_seconds,
+        "average_mbps": 0.0,
+        "median_mbps": 0.0,
+        "min_mbps": 0.0,
+        "max_mbps": 0.0,
+        "intervals": intervals,
+        "streams": streams,
+        "telemetry": {"available": False},
+    }
 
 
 def test_probe_self_check_transfers_bytes():
@@ -398,6 +458,37 @@ def test_probe_release_version_mismatch_warns_but_does_not_block(tmp_path):
         service.stop()
 
 
+def test_gate_max_hold_cancels_and_records_stuck_tcp_session(tmp_path):
+    gate_time = [0.0]
+    service, gate = build_service(
+        tmp_path,
+        gate_clock=lambda: gate_time[0],
+        gate_max_hold_seconds={"tcp_probe": 5.0},
+    )
+    assert service.start() is True
+    try:
+        registration = register(service)
+        created = service.create_session(
+            agent_id=registration["agent_id"],
+            direction="upload",
+            duration_seconds=10,
+            stream_count=1,
+        )
+
+        gate_time[0] = 6.0
+        gate_status = gate.status()
+
+        assert gate_status["active"] is False
+        assert gate_status["expired_count"] == 1
+        status = service.session_status(created["session_id"])
+        assert status["status"] == "cancelled"
+        assert "최대 실행 시간" in status["error"]
+        saved = service.saved_result_for(created["session_id"])
+        assert saved["status"] == "cancelled"
+    finally:
+        service.stop()
+
+
 @pytest.mark.parametrize("stream_count", [1, 4])
 def test_full_probe_session_runs_both_directions_and_persists(tmp_path, monkeypatch, stream_count):
     monkeypatch.setattr(service_module, "PROBE_DURATIONS", (1,))
@@ -435,6 +526,121 @@ def test_full_probe_session_runs_both_directions_and_persists(tmp_path, monkeypa
         assert len(rows) == 3
     finally:
         service.stop()
+
+
+@pytest.mark.parametrize("stream_count", [1, 4])
+def test_probe_rejects_zero_byte_agent_stream_and_fails_session(tmp_path, stream_count):
+    service, gate = build_service(tmp_path)
+    assert service.start() is True
+    try:
+        registration = register(service)
+        created = service.create_session(
+            agent_id=registration["agent_id"],
+            direction="upload",
+            duration_seconds=10,
+            stream_count=stream_count,
+        )
+        service.next_job(
+            registration["agent_id"],
+            registration["agent_token"],
+            "127.0.0.1",
+        )
+
+        status = service.complete_agent_phase(
+            created["session_id"],
+            registration["agent_id"],
+            registration["agent_token"],
+            "127.0.0.1",
+            {
+                "phase": "upload",
+                "status": "success",
+                "result": build_agent_result(
+                    stream_count=stream_count,
+                    zero_stream_id=0,
+                ),
+            },
+        )
+
+        assert status["status"] == "failed"
+        assert "전송된 데이터가 없습니다" in status["error"]
+        assert status["persistence_complete"] is True
+        assert gate.is_available() is True
+    finally:
+        service.stop()
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_error"),
+    [
+        (None, "결과 형식이 올바르지 않습니다"),
+        (
+            build_agent_result(stream_count=1, duration_seconds=0),
+            "측정 시간이 올바르지 않습니다",
+        ),
+    ],
+)
+def test_probe_missing_or_invalid_duration_agent_result_fails_session(
+    tmp_path,
+    result,
+    expected_error,
+):
+    service, gate = build_service(tmp_path)
+    assert service.start() is True
+    try:
+        registration = register(service)
+        created = service.create_session(
+            agent_id=registration["agent_id"],
+            direction="upload",
+            duration_seconds=10,
+            stream_count=1,
+        )
+        service.next_job(
+            registration["agent_id"],
+            registration["agent_token"],
+            "127.0.0.1",
+        )
+
+        status = service.complete_agent_phase(
+            created["session_id"],
+            registration["agent_id"],
+            registration["agent_token"],
+            "127.0.0.1",
+            {
+                "phase": "upload",
+                "status": "success",
+                "result": result,
+            },
+        )
+
+        assert status["status"] == "failed"
+        assert expected_error in status["error"]
+        assert status["persistence_complete"] is True
+        assert gate.is_available() is True
+    finally:
+        service.stop()
+
+
+def test_probe_clean_close_zero_byte_stream_is_rejected():
+    sender, receiver = socket.socketpair()
+    try:
+        sender.close()
+        result = run_receiver_stream(
+            receiver,
+            stream_id=0,
+            warmup_seconds=0,
+            duration_seconds=1,
+            cancel_event=threading.Event(),
+        )
+
+        assert result["bytes"] == 0
+        with pytest.raises(ProbeTransferError, match="전송된 데이터가 없습니다"):
+            aggregate_stream_results(
+                [result],
+                role="receiver",
+                duration_seconds=1,
+            )
+    finally:
+        receiver.close()
 
 
 def test_probe_cancel_releases_global_gate(tmp_path, monkeypatch):
@@ -561,12 +767,206 @@ def test_probe_storage_failure_does_not_leave_measurement_gate_locked(tmp_path, 
         assert result["result_url"] == ""
         assert result["excel_url"] == ""
         assert gate.is_available() is True
+        assert service.diagnostic_status()["failure_count"] == 1
+        assert service.diagnostic_status()["last_error_type"] == "OSError"
+    finally:
+        service.stop()
+
+
+def test_probe_archive_failure_keeps_primary_result_and_records_safe_event(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    logger = logging.getLogger("test.probe.archive")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    service, gate = build_service(tmp_path)
+    service.set_diagnostic_logger(logger)
+    assert service.start() is True
+    try:
+        registration = register(service)
+        created = service.create_session(
+            agent_id=registration["agent_id"],
+            direction="upload",
+            duration_seconds=10,
+            stream_count=1,
+        )
+
+        def fail_archive(*_args, **_kwargs):
+            raise OSError("sensitive archive path")
+
+        monkeypatch.setattr(
+            service_module,
+            "archive_csv_history",
+            fail_archive,
+        )
+
+        result = service.cancel_session(created["session_id"])
+
+        assert result["status"] == "cancelled"
+        assert result["result_available"] is True
+        assert service.saved_result_for(created["session_id"])["status"] == (
+            "cancelled"
+        )
+        assert gate.is_available()
+        assert service.diagnostic_status() == {
+            "failure_count": 1,
+            "last_event": "tcp_csv_archive_failed",
+            "last_error_type": "OSError",
+        }
+        assert "sensitive archive path" not in caplog.text
+    finally:
+        service.stop()
+
+
+def test_probe_marker_cleanup_failure_keeps_result_and_skips_archive(
+    tmp_path,
+    monkeypatch,
+):
+    service, gate = build_service(tmp_path)
+    assert service.start() is True
+    try:
+        registration = register(service)
+        created = service.create_session(
+            agent_id=registration["agent_id"],
+            direction="upload",
+            duration_seconds=10,
+            stream_count=1,
+        )
+        monkeypatch.setattr(
+            transaction_module,
+            "_finish_measurement_transaction",
+            lambda _transaction: False,
+        )
+        monkeypatch.setattr(
+            service_module,
+            "archive_csv_history",
+            lambda *_args, **_kwargs: pytest.fail("archive must be skipped"),
+        )
+
+        result = service.cancel_session(created["session_id"])
+
+        assert result["status"] == "cancelled"
+        assert result["result_available"] is True
+        assert gate.is_available() is True
+        assert service.diagnostic_status() == {
+            "failure_count": 1,
+            "last_event": "tcp_measurement_transaction_cleanup_failed",
+            "last_error_type": "OSError",
+        }
+
+        session_ids_before = set(service.sessions)
+        result_paths_before = set(service.config.results_root.glob("*.json"))
+        monkeypatch.setattr(
+            gate,
+            "acquire",
+            lambda *_args, **_kwargs: pytest.fail("gate must not be acquired"),
+        )
+        monkeypatch.setattr(
+            service,
+            "_start_job_claim_watchdog",
+            lambda *_args, **_kwargs: pytest.fail("watchdog must not start"),
+        )
+        with pytest.raises(ProbeServiceError) as raised:
+            service.create_session(
+                agent_id=registration["agent_id"],
+                direction="upload",
+                duration_seconds=10,
+                stream_count=1,
+            )
+        assert raised.value.status_code == 503
+        assert "MEASUREMENT_RECOVERY_PENDING" in str(raised.value)
+        assert set(service.sessions) == session_ids_before
+        assert set(service.config.results_root.glob("*.json")) == result_paths_before
+        agent = service.agents[registration["agent_id"]]
+        assert agent.busy_session_id == ""
+        assert agent.pending_job is None
+        assert gate.status()["active"] is False
+        assert len(
+            transaction_module.load_measurement_transactions(
+                transaction_module.measurement_transaction_root_for_log(
+                    service.config.log_path
+                )
+            )
+        ) == 1
+    finally:
+        service.stop()
+
+
+def test_probe_pending_marker_after_gate_acquire_releases_gate_without_session(
+    tmp_path,
+    monkeypatch,
+):
+    service, gate = build_service(tmp_path)
+    assert service.start() is True
+    try:
+        registration = register(service)
+        pending_checks = iter((False, True))
+        monkeypatch.setattr(
+            service_module,
+            "has_pending_measurement_transactions",
+            lambda *_args, **_kwargs: next(pending_checks),
+        )
+        monkeypatch.setattr(
+            service,
+            "_start_job_claim_watchdog",
+            lambda *_args, **_kwargs: pytest.fail("watchdog must not start"),
+        )
+        session_ids_before = set(service.sessions)
+
+        with pytest.raises(ProbeServiceError) as raised:
+            service.create_session(
+                agent_id=registration["agent_id"],
+                direction="upload",
+                duration_seconds=10,
+                stream_count=1,
+            )
+
+        assert raised.value.status_code == 503
+        assert "MEASUREMENT_RECOVERY_PENDING" in str(raised.value)
+        assert set(service.sessions) == session_ids_before
+        agent = service.agents[registration["agent_id"]]
+        assert agent.busy_session_id == ""
+        assert agent.pending_job is None
+        assert gate.status()["active"] is False
+    finally:
+        service.stop()
+
+
+def test_probe_preserves_pending_recovery_error_if_marker_appears_before_save(
+    tmp_path,
+    monkeypatch,
+):
+    service, gate = build_service(tmp_path)
+    assert service.start() is True
+    try:
+        registration = register(service)
+        pending_checks = iter((False, False, True))
+        monkeypatch.setattr(
+            service_module,
+            "has_pending_measurement_transactions",
+            lambda *_args, **_kwargs: next(pending_checks),
+        )
+        created = service.create_session(
+            agent_id=registration["agent_id"],
+            direction="upload",
+            duration_seconds=10,
+            stream_count=1,
+        )
+
+        result = service.cancel_session(created["session_id"])
+
+        assert result["status"] == "failed"
+        assert result["result_available"] is False
+        assert "MEASUREMENT_RECOVERY_PENDING" in result["error"]
+        assert "RESULT_WRITE_FAILED" not in result["error"]
+        assert gate.status()["active"] is False
     finally:
         service.stop()
 
 
 def test_probe_result_urls_wait_until_persistence_succeeds(tmp_path, monkeypatch):
-    service, _ = build_service(tmp_path)
+    service, gate = build_service(tmp_path)
     assert service.start() is True
     persistence_started = threading.Event()
     allow_persistence = threading.Event()
@@ -607,6 +1007,7 @@ def test_probe_result_urls_wait_until_persistence_succeeds(tmp_path, monkeypatch
         assert pending["result_available"] is False
         assert pending["result_url"] == ""
         assert pending["excel_url"] == ""
+        assert gate.is_available() is False
 
         allow_persistence.set()
         thread.join(timeout=3)
@@ -619,6 +1020,7 @@ def test_probe_result_urls_wait_until_persistence_succeeds(tmp_path, monkeypatch
         assert completed["result_available"] is True
         assert completed["result_url"].endswith(f"/{session_id}.json")
         assert completed["excel_url"].endswith(f"/{session_id}.xlsx")
+        assert gate.is_available() is True
     finally:
         allow_persistence.set()
         service.stop()

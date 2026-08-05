@@ -1,4 +1,4 @@
-# 사내 업로드 Codex Instructions
+# Internal Upload and Network Check Codex Instructions
 
 ## Scope
 
@@ -10,12 +10,16 @@ workstations.
 
 ## Project Summary
 
-This repository is a small internal incident-response file upload tool. It runs
-as a Python Flask web app on a Windows PC, stores uploaded files under a
-configured storage root, records upload metadata in CSV, and generates direct
-browser download links.
+This repository is an internal incident-response file transfer and network
+measurement tool. It runs as a Python Flask web app on a Windows PC, stores
+uploaded files under a configured storage root, records upload metadata in CSV,
+and generates direct browser download links. It also provides bounded quick and
+duration-based HTTP measurements, a separate TCP probe client/server flow, and
+a read-only operations summary of server health and recent measurement samples.
 
-This is not a general-purpose file transfer service. Keep the scope small.
+This is not a general-purpose file transfer, device-management, or incident
+ticketing service. Preserve the existing upload and measurement workflows and
+keep new behavior small and independently testable.
 
 ## Default Workflow
 
@@ -41,6 +45,10 @@ This is not a general-purpose file transfer service. Keep the scope small.
 - `sustained_excel.py`: in-memory Excel workbook generation for saved sustained
   HTTP measurement results.
 - `network_measurement.py`: shared single-measurement gate for HTTP and TCP checks.
+- `upload_transactions.py`: durable upload/delete transaction markers and
+  startup recovery.
+- `measurement_transactions.py`: durable HTTP sustained/TCP result intent
+  markers, JSON-to-CSV reconciliation, and fail-closed startup recovery.
 - `result_storage.py`: durable temporary-file, fsync, and atomic JSON result writes.
 - `runtime_stability.py`: CSV tail recovery, data-directory instance locking,
   rotating diagnostics, and storage health checks.
@@ -50,8 +58,14 @@ This is not a general-purpose file transfer service. Keep the scope small.
   generated client ZIP, Excel reporting, Flask API, and loopback self-check.
 - `probe_client.py`: the dedicated Windows TCP measurement client entrypoint.
 - `templates/` and `static/`: the single-page upload UI and network check mode.
+- `static/operations_dashboard.js`: read-only health and recent-measurement
+  summary rendering. It must not be presented as device inventory or incident
+  tracking.
 - `tests/`: deterministic tests for upload, download, deletion, paths, links,
-  and CSV behavior.
+  measurement validation, concurrency, fault recovery, UI structure, and CSV
+  behavior.
+- `docs/PROJECT_DIAGNOSTIC_AND_IMPROVEMENT_PLAN_KO.md`: source-backed Korean
+  usability, stability, and phased-improvement assessment.
 - `config.ini`: sample/default operational settings. Do not store real secrets.
 - `data/upload_log.csv`: tracked initial upload CSV header only; operational
   records should not be treated as source history.
@@ -64,8 +78,9 @@ This is not a general-purpose file transfer service. Keep the scope small.
 - `data/network_probe_results/`: tracked README only; operational TCP result
   JSON files must remain untracked.
 - `requirements-windows.lock`: hash-pinned Windows release build dependencies.
-- `tools/`: Windows Release ZIP build, security artifact, version resource, and
-  verification helpers.
+- `tools/`: Windows Release ZIP build, security artifact, version resource,
+  verification helpers, the resource-instrumented Windows stability soak, and
+  its contract/anomaly analyzer.
 - `.github/workflows/release.yml`: Windows runner workflow that builds and
   uploads the executable ZIP asset.
 - `.github/workflows/stability-windows.yml`: weekly 45-minute Windows upload,
@@ -77,21 +92,27 @@ Use the narrowest relevant check while developing, then run the full baseline
 before calling work complete.
 
 ```powershell
-python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
 node --check static/network_check.js
 node --check static/network_sustained.js
 node --check static/network_probe.js
 node --check static/throughput_chart.js
+node --check static/operations_dashboard.js
 python -m pytest -q
+python tools/run_windows_stability_soak.py --duration-minutes 45 --summary-path windows-soak-summary.json
+python tools/analyze_windows_soak_summary.py windows-soak-summary.json --minimum-duration-minutes 45 --output windows-soak-analysis.json
 ```
 
 On macOS in this workspace, use:
 
 ```bash
-.venv/bin/python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+.venv/bin/python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+node --check static/operations_dashboard.js
 .venv/bin/python -m pytest -q
 .venv/bin/python tools/run_stability_fault_suite.py
 .venv/bin/python tools/run_windows_stability_soak.py --duration-minutes 0.01 --max-cycles 1
+.venv/bin/python tools/run_windows_stability_soak.py --duration-minutes 45 --summary-path windows-soak-summary.json
+.venv/bin/python tools/analyze_windows_soak_summary.py windows-soak-summary.json --minimum-duration-minutes 45 --output windows-soak-analysis.json
 ```
 
 ## README / Release Document Rules
@@ -125,6 +146,11 @@ On macOS in this workspace, use:
 - Keep deletion behavior restricted by configured allowed IPs unless the user
   explicitly changes that policy.
 - Keep server and TCP client entrypoints separate in Windows releases.
+- Read a measurement result JSON only once per download request. Keep file
+  access, JSON validation, and sustained-result IP ownership in one helper, and
+  map read, encoding, or JSON failures to a sanitized domain error without raw
+  paths or tracebacks. Preserve existing missing-result 404 and sustained
+  cross-IP 403 behavior.
 - Do not add automatic firewall changes, PowerShell launch helpers, persistence,
   privilege elevation, or uploaded-file execution.
 - Keep direct executable, script, macro-document, and disk-image uploads blocked.

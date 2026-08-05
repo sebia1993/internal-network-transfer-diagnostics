@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import os
 import socket
 import sys
 import tempfile
-from configparser import ConfigParser, SectionProxy
+from configparser import ConfigParser, Error as ConfigParserError, SectionProxy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -33,6 +34,11 @@ DEFAULT_PROBE_SETTINGS = {
     "ENABLED": "true",
     "PORT": "5201",
 }
+CONFIG_VALUE_GUIDANCE = (
+    "주요 키 허용값: [app] PORT=1~65535, RECENT_LIMIT=1~10000, "
+    "BASE_URL=비어 있음 또는 http(s) URL; [network_probe] "
+    "ENABLED=true/false, yes/no, on/off, 1/0, PORT=1~65535."
+)
 
 FIREWALL_ALLOWED = "allowed"
 FIREWALL_NOT_FOUND = "not_found"
@@ -41,6 +47,10 @@ FIREWALL_NOT_APPLICABLE = "not_applicable"
 
 
 class StartupPortError(RuntimeError):
+    pass
+
+
+class ConfigFileError(StartupPortError):
     pass
 
 
@@ -275,17 +285,272 @@ def _ensure_defaults(section: SectionProxy, defaults: dict[str, str]) -> None:
             section[option] = value
 
 
-def _read_parser(path: Path) -> ConfigParser:
+def _raise_invalid_config_value(
+    path: Path,
+    section: str,
+    option: str,
+    allowed: str,
+) -> None:
+    raise ConfigFileError(
+        "설정값이 올바르지 않습니다. "
+        f"키: [{section}] {option}. 허용값: {allowed}. 설정 파일: {path.name}"
+    )
+
+
+def _validate_integer_option(
+    parser: ConfigParser,
+    path: Path,
+    section_name: str,
+    option: str,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> None:
+    if not parser.has_section(section_name):
+        return
+    section = parser[section_name]
+    existing = _find_option(section, option)
+    if existing is None:
+        return
+    raw_value = section[existing].strip()
+    allowed = (
+        f"{minimum}~{maximum} 사이의 정수"
+        if maximum is not None
+        else f"{minimum} 이상의 정수"
+    )
+    try:
+        value = int(raw_value)
+    except ValueError:
+        _raise_invalid_config_value(path, section_name, option, allowed)
+    if value < minimum or (maximum is not None and value > maximum):
+        _raise_invalid_config_value(path, section_name, option, allowed)
+
+
+def _validate_boolean_option(
+    parser: ConfigParser,
+    path: Path,
+    section_name: str,
+    option: str,
+) -> None:
+    if not parser.has_section(section_name):
+        return
+    section = parser[section_name]
+    existing = _find_option(section, option)
+    if existing is None:
+        return
+    raw_value = section[existing].strip().casefold()
+    if raw_value not in ConfigParser.BOOLEAN_STATES:
+        _raise_invalid_config_value(
+            path,
+            section_name,
+            option,
+            "true/false, yes/no, on/off 또는 1/0",
+        )
+
+
+def _option_value(
+    parser: ConfigParser,
+    section_name: str,
+    option: str,
+) -> str | None:
+    if not parser.has_section(section_name):
+        return None
+    section = parser[section_name]
+    existing = _find_option(section, option)
+    return section[existing].strip() if existing is not None else None
+
+
+def _validate_host_option(parser: ConfigParser, path: Path) -> None:
+    value = _option_value(parser, APP_SECTION, "HOST")
+    if value is None or not value:
+        return
+    allowed = "IPv4 주소 또는 포트가 없는 호스트 이름"
+    if (
+        len(value) > 253
+        or any(character.isspace() or ord(character) < 32 for character in value)
+        or any(token in value for token in ("://", "/", "\\", "[", "]"))
+        or ":" in value
+    ):
+        _raise_invalid_config_value(path, APP_SECTION, "HOST", allowed)
+    try:
+        ascii_value = value.encode("idna").decode("ascii")
+    except UnicodeError:
+        _raise_invalid_config_value(path, APP_SECTION, "HOST", allowed)
+    labels = ascii_value.split(".")
+    if (
+        any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(
+                not (character.isalnum() or character in {"-", "_"})
+                for character in label
+            )
+            for label in labels
+        )
+    ):
+        _raise_invalid_config_value(path, APP_SECTION, "HOST", allowed)
+    if all(character.isdigit() or character == "." for character in value):
+        try:
+            ipaddress.IPv4Address(value)
+        except ipaddress.AddressValueError:
+            _raise_invalid_config_value(path, APP_SECTION, "HOST", allowed)
+
+
+def _validate_base_url_option(parser: ConfigParser, path: Path) -> None:
+    value = _option_value(parser, APP_SECTION, "BASE_URL")
+    if value is None or not value:
+        return
+    allowed = (
+        "비어 있음 또는 사용자정보·query·fragment가 없는 http(s) URL "
+        "(예: http://server.example:8000)"
+    )
+    if "\\" in value or any(
+        character.isspace() or ord(character) < 32 for character in value
+    ):
+        _raise_invalid_config_value(path, APP_SECTION, "BASE_URL", allowed)
+    try:
+        parsed = urlsplit(value)
+        parsed_port = parsed.port
+    except ValueError:
+        _raise_invalid_config_value(path, APP_SECTION, "BASE_URL", allowed)
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (parsed_port is not None and not 1 <= parsed_port <= 65535)
+    ):
+        _raise_invalid_config_value(path, APP_SECTION, "BASE_URL", allowed)
+
+
+def _validate_storage_root_option(parser: ConfigParser, path: Path) -> None:
+    value = _option_value(parser, APP_SECTION, "STORAGE_ROOT")
+    if value is None:
+        return
+    if not value or any(ord(character) < 32 for character in value):
+        _raise_invalid_config_value(
+            path,
+            APP_SECTION,
+            "STORAGE_ROOT",
+            "비어 있지 않은 폴더 경로",
+        )
+
+
+def _validate_delete_allowed_ips_option(
+    parser: ConfigParser,
+    path: Path,
+) -> None:
+    value = _option_value(parser, APP_SECTION, "DELETE_ALLOWED_IPS")
+    if value is None or not value:
+        return
+    allowed = "쉼표로 구분한 개별 IPv4 또는 IPv6 주소(CIDR 제외)"
+    values = [item.strip() for item in value.split(",") if item.strip()]
+    if not values:
+        return
+    try:
+        for item in values:
+            ipaddress.ip_address(item)
+    except ValueError:
+        _raise_invalid_config_value(
+            path,
+            APP_SECTION,
+            "DELETE_ALLOWED_IPS",
+            allowed,
+        )
+
+
+def _validate_config_values(parser: ConfigParser, path: Path) -> None:
+    _validate_integer_option(
+        parser,
+        path,
+        APP_SECTION,
+        "CONFIG_VERSION",
+        minimum=0,
+        maximum=CURRENT_CONFIG_VERSION,
+    )
+    _validate_integer_option(
+        parser,
+        path,
+        APP_SECTION,
+        "PORT",
+        minimum=1,
+        maximum=65535,
+    )
+    _validate_integer_option(
+        parser,
+        path,
+        APP_SECTION,
+        "RECENT_LIMIT",
+        minimum=1,
+        maximum=10000,
+    )
+    _validate_host_option(parser, path)
+    _validate_base_url_option(parser, path)
+    _validate_storage_root_option(parser, path)
+    _validate_delete_allowed_ips_option(parser, path)
+    _validate_boolean_option(parser, path, PROBE_SECTION, "ENABLED")
+    _validate_integer_option(
+        parser,
+        path,
+        PROBE_SECTION,
+        "PORT",
+        minimum=1,
+        maximum=65535,
+    )
+
+
+def read_config_parser(
+    path: Path,
+    *,
+    preserve_option_case: bool = False,
+    ensure_sections: bool = False,
+) -> ConfigParser:
     parser = ConfigParser(interpolation=None)
-    parser.optionxform = str
-    if path.exists():
-        with path.open("r", encoding="utf-8") as handle:
-            parser.read_file(handle)
-    if not parser.has_section(APP_SECTION):
-        parser.add_section(APP_SECTION)
-    if not parser.has_section(PROBE_SECTION):
-        parser.add_section(PROBE_SECTION)
+    if preserve_option_case:
+        parser.optionxform = str
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as handle:
+                parser.read_file(handle)
+    except UnicodeError:
+        raise ConfigFileError(
+            "설정 파일 인코딩이 올바르지 않습니다. 허용값: UTF-8. "
+            f"{CONFIG_VALUE_GUIDANCE} "
+            f"설정 파일: {path.name}"
+        ) from None
+    except ConfigParserError:
+        raise ConfigFileError(
+            "설정 파일 형식이 올바르지 않습니다. "
+            "허용 형식: [app] 및 [network_probe] INI 형식. "
+            f"{CONFIG_VALUE_GUIDANCE} "
+            f"설정 파일: {path.name}"
+        ) from None
+    except OSError:
+        raise ConfigFileError(
+            "설정 파일을 읽을 수 없습니다. 허용 조건: 읽기 가능한 UTF-8 INI 파일. "
+            f"{CONFIG_VALUE_GUIDANCE} "
+            f"설정 파일: {path.name}"
+        ) from None
+
+    _validate_config_values(parser, path)
+    if ensure_sections:
+        if not parser.has_section(APP_SECTION):
+            parser.add_section(APP_SECTION)
+        if not parser.has_section(PROBE_SECTION):
+            parser.add_section(PROBE_SECTION)
     return parser
+
+
+def _read_parser(path: Path) -> ConfigParser:
+    return read_config_parser(
+        path,
+        preserve_option_case=True,
+        ensure_sections=True,
+    )
 
 
 def _write_parser(path: Path, parser: ConfigParser) -> None:
