@@ -1050,6 +1050,7 @@ class ProbeService:
         expected_phase: str | None = None,
     ) -> None:
         should_persist = False
+        gate_release_completed = False
         sockets: list[socket.socket] = []
         with self.condition:
             if expected_status is not None and session.status != expected_status:
@@ -1077,18 +1078,23 @@ class ProbeService:
             for sock in sockets:
                 self._close_socket(sock)
             if should_persist:
+                persistence_error: Exception | None = None
                 try:
                     self._persist_result(session)
                 except Exception as exc:
+                    persistence_error = exc
                     self._record_diagnostic_failure(
                         "tcp_result_persistence_failed",
                         exc,
                     )
-                    with self.condition:
+                with self.condition:
+                    self.measurement_gate.release("tcp_probe", session.session_id)
+                    gate_release_completed = True
+                    if persistence_error is not None:
                         session.status = "failed"
                         session.error = (
-                            str(exc)
-                            if isinstance(exc, ProbeServiceError)
+                            str(persistence_error)
+                            if isinstance(persistence_error, ProbeServiceError)
                             else (
                                 "TCP 측정 결과 저장 실패. 오류 코드: "
                                 "RESULT_WRITE_FAILED. 서버 진단 로그를 확인한 뒤 다시 "
@@ -1102,8 +1108,7 @@ class ProbeService:
                             preserve_session_id=session.session_id
                         )
                         self.condition.notify_all()
-                else:
-                    with self.condition:
+                    else:
                         session.result_available = True
                         session.persistence_complete = True
                         session.completed_at_monotonic = self.clock()
@@ -1112,7 +1117,7 @@ class ProbeService:
                         )
                         self.condition.notify_all()
         finally:
-            if should_persist:
+            if should_persist and not gate_release_completed:
                 self.measurement_gate.release("tcp_probe", session.session_id)
 
     def _persist_result(self, session: ProbeSession) -> None:

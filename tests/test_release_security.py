@@ -32,6 +32,9 @@ def test_windows_release_build_requires_clean_worktree_and_onedir_bundles():
     assert "InternalUploadServer.exe" in script
     assert "NetworkProbeClient.exe" in script
     assert "powershell.exe" not in script.casefold()
+    assert "v0.5.1`` tag workflow" in script
+    assert "``persistence_complete``" in script
+    assert "gate 해제와 완료 플래그 공개를 같은 임계구역" in script
 
 
 def test_security_artifacts_record_commit_roles_and_file_hashes(tmp_path):

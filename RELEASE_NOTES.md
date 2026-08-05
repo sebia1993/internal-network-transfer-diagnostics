@@ -1,14 +1,27 @@
 # Release Notes 운영 규칙
 
-현재 앱 버전: `v0.5.1`
+현재 앱 버전: `v0.5.2`
 
 이 파일은 저장소에 커밋하는 릴리즈 준비 점검 문서입니다. 현재 GitHub Actions가 Windows 실행 ZIP을 만들고 GitHub Release에 업로드합니다. Release 본문은 이 파일과 `CHANGELOG.md` 기준으로 작성합니다.
+
+## v0.5.2 - 2026-08-05
+
+`v0.5.1`은 원격 annotated tag와 checkout commit 검증을 통과했지만, Windows CI에서 TCP timeout 세션의 결과 영속화가 끝나기 전에 measurement gate를 확인한 테스트 3건이 경합으로 실패했습니다. GitHub Release와 asset은 생성되지 않았고 기존 태그는 이동하거나 삭제하지 않았습니다.
+
+`v0.5.2`는 timeout 회귀 테스트가 `persistence_complete`까지 제한 시간 안에 기다린 뒤 gate 해제를 확인하도록 안정화합니다. TCP 결과 저장 뒤에는 gate를 먼저 해제하고 같은 임계구역에서 완료 플래그를 공개해, 완료로 보인 직후 새 측정이 일시적으로 거절되는 창도 제거합니다. 결과 저장이 끝나기 전에는 새 측정을 막는 기존 안전 계약, 기존 URL·CSV·JSON·Excel 형식과 TCP 프로토콜 `v2` 호환성은 변경하지 않습니다.
+
+게시 전 게이트:
+
+- 전체 회귀 458건, 장애 주입 32건, Python compileall, JavaScript 5개 구문 검사와 `pip check`
+- clean Windows onedir 빌드, 서버 smoke·TCP 자체 점검, 클라이언트 자체 점검과 한글 경로 실행
+- ZIP verifier, `security_manifest.source_commit`, SHA256와 실행 CMD UTF-8 no-BOM 검사
+- 같은 commit을 가리키는 원격 annotated tag와 `gh release create --verify-tag`
 
 ## v0.5.1 - 2026-08-05
 
 `v0.5.0` annotated tag push는 Actions checkout이 로컬 tag ref를 commit object로 평탄화해 immutable-tag 타입 검사에서 빌드 전에 중단됐습니다. GitHub Release와 asset은 생성되지 않았고 기존 태그는 이동하거나 삭제하지 않았습니다.
 
-`v0.5.1`은 원격의 정확한 tag ref를 force-fetch한 뒤 annotated object type과 checkout commit을 검사합니다. `v0.5.0`에 준비한 모든 사용성·안정성 개선, 기존 URL·CSV·JSON·Excel 형식과 TCP 프로토콜 `v2` 호환성을 그대로 포함합니다.
+`v0.5.1`은 원격의 정확한 tag ref를 force-fetch한 뒤 annotated object type과 checkout commit을 검사합니다. 이 검사는 통과했지만 Windows CI의 비동기 timeout 테스트 3건이 결과 영속화 완료 전 gate를 확인해 실패했고 GitHub Release와 asset은 생성되지 않았습니다. `v0.5.0`에 준비한 모든 사용성·안정성 개선, 기존 URL·CSV·JSON·Excel 형식과 TCP 프로토콜 `v2` 호환성을 그대로 포함합니다.
 
 게시 전 게이트:
 
@@ -42,7 +55,7 @@
 - Python `compileall`, JavaScript 5개 `node --check`, `pip check`, `git diff --check` 통과
 - Windows 2,708.89초 반복 시험: 386 cycles, 업로드 101,187,584 bytes, TCP 자체 점검 386회, 772 processes/1,544 samples
 - soak 분석 결과: quality `pass`, issues 0, findings 0, `PASS_NO_REPEATED_PROCESS_GROWTH`
-- 로컬 `v0.5.0` onedir ZIP의 서버 smoke, 서버 TCP 자체 점검, 클라이언트 자체 점검, 보안 산출물과 ZIP verifier는 통과했습니다. tag workflow는 위 immutable-tag 검사 문제로 빌드 전에 중단돼 Release asset은 게시하지 않았으며 `v0.5.1`이 이를 대체합니다.
+- 로컬 `v0.5.0` onedir ZIP의 서버 smoke, 서버 TCP 자체 점검, 클라이언트 자체 점검, 보안 산출물과 ZIP verifier는 통과했습니다. `v0.5.0`과 `v0.5.1` tag workflow는 각각 immutable-tag 검사와 비동기 테스트 경합으로 중단돼 Release asset을 게시하지 않았으며 `v0.5.2`가 이를 대체합니다.
 
 남은 운영 한계:
 
@@ -531,14 +544,14 @@ GitHub에 push하거나 Release를 준비하기 전에 아래 문서를 함께 �
 
 현재 GitHub Release는 태그 기준으로 생성하고, Windows 실행 ZIP은 GitHub Actions에서 빌드해 업로드합니다.
 
-- 태그 형식: 사전 릴리즈는 `v0.5.1-rc.1`, 정식 릴리즈는 `v0.5.1`처럼 관리합니다.
-- Release 제목: `v0.5.1 - 사내 업로드 사용성 및 안정성 개선`
+- 태그 형식: 사전 릴리즈는 `v0.5.2-rc.1`, 정식 릴리즈는 `v0.5.2`처럼 관리합니다.
+- Release 제목: `v0.5.2 - 사내 업로드 사용성 및 안정성 개선`
 - Release 본문: 포함 기능, 제외 항목, 검증 명령, 실행 방법, asset 정책을 한국어로 적습니다.
-- 직접 업로드하는 Release asset: `internal-upload_v0.5.1_windows.zip`, `.zip.sha256`
+- 직접 업로드하는 Release asset: `internal-upload_v0.5.2_windows.zip`, `.zip.sha256`
 - SHA256 checksum은 별도 asset과 Release 본문에 기록합니다.
 - 같은 태그의 GitHub Release가 이미 있으면 실패 처리하며 기존 asset을 덮어쓰지 않습니다.
 
-GitHub가 자동으로 표시하는 `Source code (zip)` / `Source code (tar.gz)`는 tag 기준 소스 아카이브입니다. 일반 사용자는 `internal-upload_v0.5.1_windows.zip`을 다운로드합니다.
+GitHub가 자동으로 표시하는 `Source code (zip)` / `Source code (tar.gz)`는 tag 기준 소스 아카이브입니다. 일반 사용자는 `internal-upload_v0.5.2_windows.zip`을 다운로드합니다.
 
 ZIP 내부 구조:
 
@@ -584,11 +597,11 @@ node --check static/throughput_chart.js
 node --check static/operations_dashboard.js
 python -m pytest -q
 python tools\run_stability_fault_suite.py
-pwsh -NoProfile -File .\tools\build_windows_release.ps1 -Version v0.5.1
-dist\internal-upload_v0.5.1_windows\InternalUploadServer.exe --smoke-check
-dist\internal-upload_v0.5.1_windows\InternalUploadServer.exe --probe-self-check
-dist\internal-upload_v0.5.1_windows\client-template\NetworkProbeClient.exe --self-check
-python tools\verify_release_zip.py --zip dist\internal-upload_v0.5.1_windows.zip --version v0.5.1
+pwsh -NoProfile -File .\tools\build_windows_release.ps1 -Version v0.5.2
+dist\internal-upload_v0.5.2_windows\InternalUploadServer.exe --smoke-check
+dist\internal-upload_v0.5.2_windows\InternalUploadServer.exe --probe-self-check
+dist\internal-upload_v0.5.2_windows\client-template\NetworkProbeClient.exe --self-check
+python tools\verify_release_zip.py --zip dist\internal-upload_v0.5.2_windows.zip --version v0.5.2
 ```
 
 ## 작성하지 않을 내용
