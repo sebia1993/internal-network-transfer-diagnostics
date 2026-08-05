@@ -1,7 +1,7 @@
 # 사내 파일 전송 및 네트워크 체크 프로젝트 진단 및 개선 계획
 
 작성 기준: 2026-08-05 현재 작업트리
-대상 버전: 정식 릴리스 준비 중인 소스 `v0.5.2`
+대상 버전: 정식 릴리스 준비 중인 소스 `v0.5.3`
 대상 사용자: 초급 네트워크 엔지니어, 상급 관리자 및 IT 관리 책임자
 
 ## 보고서의 판단 기준
@@ -103,7 +103,7 @@
 
 **추가 확인이 필요한 사항**
 
-현재 소스 버전은 `v0.5.2`로 올렸지만, Windows ZIP은 clean commit 빌드, 서버·클라이언트 자체 점검, ZIP verifier와 SHA256 대조를 모두 통과한 뒤에만 배포 가능으로 판단한다. 기존 `v0.4.6` Release asset에는 이번 변경이 포함되지 않고, `v0.5.0`과 `v0.5.1` 태그는 각각 immutable-tag 검사와 Windows 비동기 테스트 경합으로 workflow가 중단돼 Release asset이 없다.
+현재 소스 버전은 `v0.5.3`으로 올렸지만, Windows ZIP은 clean commit 빌드, 서버·클라이언트 자체 점검, ZIP verifier와 SHA256 대조를 모두 통과한 뒤에만 배포 가능으로 판단한다. 기존 `v0.4.6` Release asset에는 이번 변경이 포함되지 않고, `v0.5.0`, `v0.5.1`, `v0.5.2` 태그는 각각 immutable-tag 검사, Windows TCP timeout 테스트 경합, fault 준비 마커 경합으로 workflow가 중단돼 Release asset이 없다.
 
 별도 설명 없이 설치·실행할 수 있는 수준은 아니다. 포터블 ZIP 안의 시작 CMD로 실행 자체는 단순하지만, 사용자는 실행용 asset과 GitHub 소스 ZIP을 구분하고 압축을 완전히 풀어야 하며 SmartScreen, 방화벽과 TCP 클라이언트 준비 절차는 README가 필요하다. 필수 Python·라이브러리는 소스 실행 사용자에게만 필요하고, 정식 onedir ZIP 사용자는 내장 런타임을 사용한다.
 
@@ -210,7 +210,7 @@ Windows의 buffered read는 소켓 `SHUT_RDWR`만으로 항상 풀리지 않는�
 **코드에서 확인된 사실**
 
 - 현재 README와 repo-local `AGENTS.md`는 파일 업로드뿐 아니라 빠른 HTTP, 시간 기준 HTTP, TCP 측정과 읽기 전용 운영 요약까지 설명하도록 이번 작업트리에서 갱신했다.
-- GitHub의 기존 정식 `v0.4.6` ZIP은 이번 `v0.5.2` 소스보다 이전 상태다. `v0.5.0`과 `v0.5.1`은 tag workflow가 각각 tag 검사와 source-check 단계에서 중단돼 실행 asset이 없다. 따라서 이 문서의 기능 “완료” 표시는 소스와 자동 회귀 범위에 적용하며, 배포 완료 표시는 별도의 clean ZIP·태그 workflow·게시 asset 검증을 통과해야 한다.
+- GitHub의 기존 정식 `v0.4.6` ZIP은 이번 `v0.5.3` 소스보다 이전 상태다. `v0.5.0`, `v0.5.1`, `v0.5.2`는 tag workflow가 tag 검사 또는 source-check 단계에서 중단돼 실행 asset이 없다. 따라서 이 문서의 기능 “완료” 표시는 소스와 자동 회귀 범위에 적용하며, 배포 완료 표시는 별도의 clean ZIP·태그 workflow·게시 asset 검증을 통과해야 한다.
 - 운영 요약은 장비 인벤토리나 incident 관리 기능이 아니라 최근 측정 표본과 서버 기능 상태의 요약이다. 화면과 README에 이 범위를 명시했다.
 
 ---
@@ -322,21 +322,21 @@ HTTP와 TCP 각각에서 JSON 확정 직후, `full` 첫 CSV 행 확정 직후 �
 
 **코드에서 확인된 사실**
 
-소스 버전 문자열과 변경 기록은 `v0.5.2`로 정리했다. 기존 `v0.4.6` ZIP에는 이 변경이 없고, 실패 이력인 `v0.5.0`과 `v0.5.1` tag에는 Release asset이 없다. `v0.5.2`는 clean source commit과 동일한 원격 annotated tag에서 빌드해야 한다.
+소스 버전 문자열과 변경 기록은 `v0.5.3`으로 정리했다. 기존 `v0.4.6` ZIP에는 이 변경이 없고, 실패 이력인 `v0.5.0`, `v0.5.1`, `v0.5.2` tag에는 Release asset이 없다. `v0.5.3`은 clean source commit과 동일한 원격 annotated tag에서 빌드해야 한다.
 
 **실행에서 확인된 사실**
 
 첫 clean commit 빌드를 Windows PowerShell 5.1에서 실행했을 때 EXE 세 자체 점검은 통과했지만, BOM 없는 UTF-8 `.ps1`의 한국어가 잘못 해석돼 ZIP verifier가 시작 CMD 안내를 거부했다. 이때 Python verifier의 종료 코드 1도 빌드 스크립트가 즉시 전파하지 않아 SHA 파일까지 생성되는 결함을 확인했다. 다음 빌드에서는 `.ps1` BOM으로 한국어는 복구됐지만, PowerShell 5.1의 `Set-Content -Encoding UTF8`이 실행 CMD 앞에 BOM을 붙여 `@echo off` 실행이 실패하는 경계도 확인했다. 실패한 ZIP들은 게시하지 않았다. `build_windows_release.ps1`은 UTF-8 BOM으로 저장하고 CMD는 UTF-8 no-BOM으로 직접 쓰며 version metadata·PyInstaller·보안 산출물·ZIP verifier의 native 종료 코드를 모두 검사한다. Actions의 compile·JS·pytest·fault·dependency 검사도 각 종료 코드를 즉시 전파한다. 회귀와 ZIP verifier는 이 두 인코딩 계약과 실패 전파 지점을 고정한다.
 
-`v0.5.0` annotated tag를 push한 뒤에는 Actions checkout이 해당 로컬 tag ref를 commit object로 평탄화해 annotated type 검사에서 빌드 전에 중단됐다. 원격 tag 자체는 annotated였고 올바른 source commit을 가리켰으며 Release와 asset은 생성되지 않았다. `v0.5.1` workflow는 원격의 정확한 tag ref를 force-fetch해 tag 검증을 통과했지만, Windows CI에서 TCP timeout 세션의 결과 영속화 완료 전에 measurement gate를 확인한 테스트 3건이 경합으로 실패해 Release와 asset을 만들지 않았다. 두 태그는 이동·삭제하지 않고 실패 이력으로 보존했다. `v0.5.2`는 같은 immutable-tag 검사를 유지하면서 해당 테스트가 `persistence_complete`까지 제한 시간 안에 기다리게 하고, 저장 후 gate 해제와 완료 플래그 공개를 같은 임계구역에 묶는다.
+`v0.5.0` annotated tag를 push한 뒤에는 Actions checkout이 해당 로컬 tag ref를 commit object로 평탄화해 annotated type 검사에서 빌드 전에 중단됐다. 원격 tag 자체는 annotated였고 올바른 source commit을 가리켰으며 Release와 asset은 생성되지 않았다. `v0.5.1` workflow는 원격의 정확한 tag ref를 force-fetch해 tag 검증을 통과했지만, Windows CI에서 TCP timeout 세션의 결과 영속화 완료 전에 measurement gate를 확인한 테스트 3건이 경합으로 실패했다. `v0.5.2`는 전체 회귀 458건을 통과한 뒤 별도 fault suite에서 준비 파일 생성과 내용 쓰기 사이에 빈 업로드 ID를 읽은 테스트 동기화 경합 1건으로 중단됐다. 세 태그는 이동·삭제하지 않고 실패 이력으로 보존했다. `v0.5.3`은 immutable-tag 검사와 TCP 완료 순서 개선을 유지하면서 fault 준비 마커의 비어 있지 않은 동일 내용 스냅샷을 사용한다.
 
 **영향**
 
-기존 `v0.4.6` GitHub Release ZIP을 설치하면 이 보고서에서 완료로 표시한 개선이 포함되지 않는다. `v0.5.0`과 `v0.5.1`에는 실행 asset이 없고, `v0.5.2`도 태그 workflow와 asset 검증이 끝나기 전에는 실행용 소스 ZIP과 혼동하면 안 된다.
+기존 `v0.4.6` GitHub Release ZIP을 설치하면 이 보고서에서 완료로 표시한 개선이 포함되지 않는다. `v0.5.0`, `v0.5.1`, `v0.5.2`에는 실행 asset이 없고, `v0.5.3`도 태그 workflow와 asset 검증이 끝나기 전에는 실행용 소스 ZIP과 혼동하면 안 된다.
 
 **권고**
 
-수정된 `v0.5.2` clean worktree에서 PyInstaller onedir 빌드, ZIP 검증, SHA256/SBOM과 실제 EXE 자체 점검을 다시 수행한다. 같은 source commit을 가리키는 원격 annotated tag가 없으면 release workflow를 중단하고 기존 asset은 덮어쓰지 않는다.
+수정된 `v0.5.3` clean worktree에서 PyInstaller onedir 빌드, ZIP 검증, SHA256/SBOM과 실제 EXE 자체 점검을 다시 수행한다. 같은 source commit을 가리키는 원격 annotated tag가 없으면 release workflow를 중단하고 기존 asset은 덮어쓰지 않는다.
 
 ### 4.6 실제 브라우저와 운영망 검증 미완료
 
@@ -614,7 +614,7 @@ working set은 initial 기준 54,228,992 bytes에서 최종 55,867,392 bytes로 
 | P1 | 완료, 데이터 | marker 행·JSON 의미 불일치, rollback 부분 실패와 pending 상태의 후속 측정 | marker 손상, CSV 정리 또는 JSON 삭제 단독 실패, marker cleanup 실패 | 잘못된 요약 복구, 불필요한 재측정 트래픽 또는 다음 시작 중단 | 기존 원인: marker 행 재생성·rollback 상태와 시작 전 차단 부재(해소) | `measurement_transactions.py`, `network_sustained.py`, `network_probe/service.py` | JSON에서 행 재생성·전체 대조, durable `rollback_requested`, 시작 전 503 차단, TCP gate 경쟁 시 해제와 복구 오류 보존 적용 완료 | semantic mismatch, 두 부분 rollback, gate/session/watchdog 미실행, gate race release, 오류 코드 보존 | 측정 저장 계층과 시작 경로 |
 | P1 | 완료, 장시간 검증 | 재시작 반복 중 자원 증가 여부가 추측에 머묾 | 업로드·kill·restart·TCP 반복 | 누수나 핸들 증가를 배포 전에 놓칠 수 있음 | 짧은 1 cycle만 존재했던 검증 공백(해소) | `tools/run_windows_stability_soak.py`, `tools/analyze_windows_soak_summary.py` | 2,708.89초, 386 cycles, 772 processes/1,544 samples 계측과 품질 gate·4종 anomaly 판정 완료 | quality pass/issues 0/findings 0, `PASS_NO_REPEATED_PROCESS_GROWTH` | 테스트·CI 분석 |
 | P1 | 완료, 결과 다운로드 | JSON 검증 뒤 재독 사이 삭제 경합이 HTML 500과 절대경로 traceback으로 노출 | 1,000개 초과 결과 보존 정리와 다운로드가 겹치거나 파일이 잠김·삭제됨 | 초급 사용자가 개발자 오류를 보고 결과를 받지 못함 | 존재·권한 검증과 응답 읽기가 두 번의 파일 접근으로 분리됨 | `network_sustained.py`, `network_probe/service.py`, `network_probe/routes.py` | 원문을 한 번 읽어 JSON·소유자를 검증하고 `OSError`, `UnicodeError`, 손상 JSON을 `RESULT_READ_FAILED`로 변환 | 삭제 경합, invalid UTF-8, 단일 읽기, 404/403·헤더 회귀 | 결과 조회 helper와 두 JSON route |
-| P1 | 진행 중, 배포 게이트 | `v0.5.2` 소스와 게시 asset의 동일 commit 여부를 아직 확인해야 함 | 기존 v0.4.6 설치, checkout의 tag ref 평탄화 또는 비동기 테스트 경합 | 개선 전 동작 사용, tag/source 불일치 또는 false-negative CI | 원격 tag object 재조회 누락과 영속화 완료를 기다리지 않는 timeout 테스트 | `app_version.py`, `test_network_probe.py`, `build_windows_release.ps1`, `release.yml` | 원격 tag ref를 force-fetch하고 비동기 완료 조건을 제한 시간으로 기다린 clean commit의 annotated tag만 `--verify-tag`로 게시 | ZIP verifier, 3개 EXE 자체 점검, manifest commit, SHA256와 Release asset 대조 | 테스트/빌드/릴리스 |
+| P1 | 진행 중, 배포 게이트 | `v0.5.3` 소스와 게시 asset의 동일 commit 여부를 아직 확인해야 함 | 기존 v0.4.6 설치, checkout의 tag ref 평탄화 또는 비동기 테스트 경합 | 개선 전 동작 사용, tag/source 불일치 또는 false-negative CI | 원격 tag object 재조회 누락, 영속화 완료 또는 준비 마커 내용을 기다리지 않는 테스트 | `app_version.py`, `test_network_probe.py`, `test_fault_injection.py`, `build_windows_release.ps1`, `release.yml` | 원격 tag ref를 force-fetch하고 비동기 완료·비어 있지 않은 준비 내용을 제한 시간으로 기다린 clean commit의 annotated tag만 `--verify-tag`로 게시 | ZIP verifier, 3개 EXE 자체 점검, manifest commit, SHA256와 Release asset 대조 | 테스트/빌드/릴리스 |
 | P1 | 잔여, 보안 | 인증/TLS 없이 사내망에 노출되고 TCP token이 평문 제어 채널을 통과 | 신뢰하지 않는 단말이나 도청 가능한 구간이 같은 망에 존재 | 무단 업로드·부하, token 재사용 가능성 | trusted-LAN 전제의 초기 도구 범위 | Flask 라우트 전체, TCP agent API | 우선 망 분리·접근 통제, 인증/TLS는 기존 URL과 client 호환성을 포함한 별도 버전으로 설계 | 보안 검토, 패킷 노출과 token 재사용 시험 | 아키텍처와 배포 |
 | P1 | 잔여, 운영자료 | 추적 runtime template에 운영값이 기록된 뒤 Git stage 가능 | 같은 clone에서 운영 후 `git add -A` | 내부 주소·기록의 우발적 커밋 | header template 네 파일을 의도적으로 추적 | `config.ini`, `data/*.csv`, `tests/test_app.py` | header-only/default 자동 test를 유지하고 stage 전 파일 확인을 릴리스 체크리스트에 둔다 | repository template test, `git diff --cached` 점검 | 저장소 운영 절차 |
 | P1 | 잔여, 현장 UX | 실제 Edge/Chrome/Android/스크린리더 미검증 | 현장 브라우저 사용 | 레이아웃/포커스 문제 누락 가능 | Computer Use URL 안전 확인 3회 연속 실패 | `templates`, `static` | 민감정보 없는 수동 체크리스트로 현장 검증 | 브라우저별 캡처와 NVDA 기록 | 검증 문서, 소규모 UI |
@@ -765,13 +765,13 @@ working set은 initial 기준 54,228,992 bytes에서 최종 55,867,392 bytes로 
 
 ## 12. 최종 권고사항
 
-현재 `v0.5.2` 소스는 초기 상태보다 데이터 무결성과 실패 가시성이 크게 좋아졌고 전체 회귀 458건, fault suite 32건과 실제 45분 Windows 반복 시험에서도 기능 계약과 반복 프로세스 자원 추이가 통과했다. 남은 작업의 우선순위는 새 기능 개발이 아니다. 동일 commit의 onedir ZIP과 GitHub asset을 검증한 뒤, 실제 브라우저와 현장 환경에서 사용자 흐름을 확인하는 일이 먼저다.
+현재 `v0.5.3` 소스는 초기 상태보다 데이터 무결성과 실패 가시성이 크게 좋아졌고 전체 회귀 458건, fault suite 32건과 실제 45분 Windows 반복 시험에서도 기능 계약과 반복 프로세스 자원 추이가 통과했다. 남은 작업의 우선순위는 새 기능 개발이 아니다. 동일 commit의 onedir ZIP과 GitHub asset을 검증한 뒤, 실제 브라우저와 현장 환경에서 사용자 흐름을 확인하는 일이 먼저다.
 
 ### 즉시 수정해야 할 항목 5개
 
 전체 회귀 458건과 fault suite 32건, 실제 2,708.89초 Windows soak의 검증 범위에서 즉시 재현된 잔여 P0는 없다. 다음은 배포 전 P1 검증 또는 사용성 보완이다.
 
-1. 현재 `v0.5.2` clean commit으로 onedir EXE/ZIP을 만든 뒤 저권한·한글 경로·Python 미설치 검증
+1. 현재 `v0.5.3` clean commit으로 onedir EXE/ZIP을 만든 뒤 저권한·한글 경로·Python 미설치 검증
 2. 실제 Edge/Chrome/Android/NVDA에서 첫 화면, 부분 완료, API 지연과 키보드 흐름 검증
 3. 인증/TLS와 trusted-host가 없는 현재 서비스의 신뢰망 배치, 평문 token, Host 기반 client URL과 접근 통제 확인
 4. 단일 서버 프로세스 장기 실행으로 heap/private bytes와 watcher 누수 검증
@@ -795,7 +795,7 @@ working set은 initial 기준 54,228,992 bytes에서 최종 55,867,392 bytes로 
 
 ### 가장 먼저 수정할 파일 또는 모듈
 
-다음 배포 작업의 첫 대상은 `tests/test_network_probe.py`, `tools/build_windows_release.ps1`, `tools/verify_release_zip.py`와 `.github/workflows/release.yml`이다. 전체 회귀 458건, fault 32건, compileall, 5개 JavaScript 구문 검사, diff-check와 45분 soak 분석이 이미 통과했으므로 서버 업무 코드를 더 바꾸기보다 timeout 테스트의 완료 조건만 결정론적으로 만든 현재 `v0.5.2` 상태 그대로 새 onedir ZIP을 만들어야 한다. verifier로 실행 파일 구성, 보안 산출물, SHA256, 기본 `config.ini`, header-only CSV와 운영 결과 미포함을 확인한 뒤 같은 commit의 원격 annotated tag에서만 게시한다.
+다음 배포 작업의 첫 대상은 `tests/test_network_probe.py`, `tests/test_fault_injection.py`, `tools/build_windows_release.ps1`, `tools/verify_release_zip.py`와 `.github/workflows/release.yml`이다. 전체 회귀 458건, fault 32건, compileall, 5개 JavaScript 구문 검사, diff-check와 45분 soak 분석이 이미 통과했으므로 서버 업무 코드를 더 바꾸기보다 비동기 테스트 완료 조건만 결정론적으로 만든 현재 `v0.5.3` 상태 그대로 새 onedir ZIP을 만들어야 한다. verifier로 실행 파일 구성, 보안 산출물, SHA256, 기본 `config.ini`, header-only CSV와 운영 결과 미포함을 확인한 뒤 같은 commit의 원격 annotated tag에서만 게시한다.
 
 ### 첫 번째 작업 단위에서 수행할 구체적인 변경사항
 
@@ -811,7 +811,7 @@ working set은 initial 기준 54,228,992 bytes에서 최종 55,867,392 bytes로 
 
 ### 다음 작업 단위
 
-1. 결정된 `v0.5.2` 버전으로 clean onedir ZIP, 보안 산출물과 SHA256을 검증하고 같은 commit의 원격 annotated tag를 게시한다.
+1. 결정된 `v0.5.3` 버전으로 clean onedir ZIP, 보안 산출물과 SHA256을 검증하고 같은 commit의 원격 annotated tag를 게시한다.
 2. 하나의 서버 프로세스를 장시간 유지하는 별도 시험으로 heap/private bytes와 watcher 누수를 확인한다.
 3. Computer Use URL 안전 확인 3회 실패로 남은 실제 Edge/Chrome/Android/NVDA 검증을 민감정보 없는 수동 체크리스트로 수행한다.
 4. 실제 브라우저 체크리스트에서 확인된 문제만 작은 독립 변경으로 수정한다.

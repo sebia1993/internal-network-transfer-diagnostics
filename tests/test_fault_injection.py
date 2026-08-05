@@ -22,11 +22,23 @@ from runtime_stability import DataDirectoryLock, InstanceLockError, ensure_csv_i
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def wait_for_path(path: Path, process: subprocess.Popen, timeout: float = 5.0) -> None:
+def wait_for_path(
+    path: Path,
+    process: subprocess.Popen,
+    timeout: float = 5.0,
+    *,
+    completion_marker: bytes | None = None,
+) -> bytes:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if path.exists():
-            return
+        try:
+            payload = path.read_bytes()
+        except (FileNotFoundError, OSError):
+            payload = None
+        if payload is not None and (
+            completion_marker is None or payload.endswith(completion_marker)
+        ):
+            return payload
         if process.poll() is not None:
             stdout, stderr = process.communicate()
             raise AssertionError(
@@ -164,13 +176,17 @@ begin_upload_transaction(
     row=row,
 )
 commit_uploaded_file(BytesIO(b"committed-before-log"), reservation)
-ready.write_text(reservation.upload_id, encoding="ascii")
+ready.write_text(f"{reservation.upload_id}\\n", encoding="ascii")
 time.sleep(60)
 """
     process = start_worker(code, config_path, ready_path)
     try:
-        wait_for_path(ready_path, process)
-        upload_id = ready_path.read_text(encoding="ascii")
+        ready_payload = wait_for_path(
+            ready_path,
+            process,
+            completion_marker=b"\n",
+        )
+        upload_id = ready_payload.decode("ascii").rstrip("\r\n")
         kill_process(process)
 
         config = app_module.load_config(config_path)
