@@ -1,0 +1,54 @@
+name: PR Validation
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-verify:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install hash-pinned dependencies
+        shell: pwsh
+        run: python -m pip install --require-hashes -r requirements-windows.lock
+
+      - name: Run source regression checks
+        shell: pwsh
+        run: |
+          python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+          node --check static/network_check.js
+          node --check static/network_sustained.js
+          node --check static/network_probe.js
+          node --check static/throughput_chart.js
+          node --check static/operations_dashboard.js
+          python -m pytest -q
+          python tools/run_stability_fault_suite.py
+          python -m pip check
+
+      - name: Build Windows release candidate
+        shell: pwsh
+        run: .\tools\build_windows_release.ps1 -Version v0.5.3
+
+      - name: Verify Windows release candidate
+        shell: pwsh
+        run: python tools\verify_release_zip.py --zip dist\internal-upload_v0.5.3_windows.zip --version v0.5.3
