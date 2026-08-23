@@ -10,6 +10,8 @@
 - PR/main Windows validation의 모든 native exit를 즉시 검사해 뒤 명령이 앞선 실패를 덮는 false-green을 제거했습니다.
 - Windows soak/analyzer 출력을 UTF-8로 고정하고 Step Summary는 bounded Markdown, 원시 JSON은 artifact로 분리했습니다.
 - MIT License, CodeQL, tracked secret scan, 독립 SBOM Release asset과 현재 보안·검증·UI 안내 문서를 추가했습니다.
+- 기본 CodeQL 분석에서 확인된 예외 정보 응답 경로를 고정된 사용자 메시지로 바꾸고, 전체 인터페이스 바인딩의 비루프백 인증 경계를 문서와 회귀 테스트로 명시했습니다.
+- Windows artifact 업로드 action을 Node.js 24 기반 v7.0.1 exact commit으로 고정하고 pytest 잠금을 9.1.1로 갱신했습니다.
 - 기존 업로드 transaction, bounded server, CSV·JSON·Excel 저장 형식은 유지합니다. TCP `v2` client는 호환되지 않으므로 새 ZIP이 필요합니다.
 
 ## v0.5.3 - 2026-08-05

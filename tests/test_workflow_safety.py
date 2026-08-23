@@ -38,7 +38,10 @@ def test_soak_keeps_step_summary_bounded_and_raw_json_in_artifact():
     assert 'PYTHONUTF8: "1"' in workflow
     assert 'PYTHONIOENCODING: "utf-8"' in workflow
     assert "render_windows_soak_summary.py" in workflow
-    assert "actions/upload-artifact@" in workflow
+    assert (
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1"
+        in workflow
+    )
     assert "windows-soak-summary.json" in workflow
     assert "windows-soak-analysis.json" in workflow
     assert "Get-Content windows-soak-summary.json >> $env:GITHUB_STEP_SUMMARY" not in workflow

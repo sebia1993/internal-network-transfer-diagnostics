@@ -21,6 +21,8 @@
 - master Bearer는 cookie를 사용하지 않으므로 CSRF 검증 대상이 아닙니다.
 - 세션은 설정된 TTL을 넘으면 실패 시 차단합니다.
 
+기본 `HOST=0.0.0.0` 바인딩은 한 내부망 서버가 여러 네트워크 인터페이스에서 Windows 클라이언트 요청을 받기 위한 의도된 동작이며 인증 우회가 아닙니다. 비루프백 HTTP 요청은 route 처리 전에 유효한 로그인 세션 또는 master Bearer가 없으면 거부되고, cookie 기반 상태 변경은 CSRF 검증도 통과해야 합니다. 인터넷 직접 노출은 지원 범위가 아니며 단일 인터페이스만 필요하면 `HOST`를 해당 내부 주소로 좁히세요. 이 경계는 `tests/test_access_security.py::test_all_interfaces_binding_does_not_bypass_remote_authentication` 회귀 테스트로 고정합니다.
+
 역방향 프록시를 사용할 때 애플리케이션은 `X-Forwarded-For`를 신뢰하지 않습니다. 실제 peer가 프록시이면 그 peer 주소를 기준으로 판단합니다. 프록시 신뢰 설정과 원본 IP 정책은 운영자가 별도 경계에서 구성해야 합니다.
 
 ## 비밀 생성·보관

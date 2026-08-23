@@ -444,12 +444,15 @@ class SustainedCheckManager:
             if status == "success":
                 try:
                     self._validate_success_client_results(session, payload)
-                except SustainedCheckError as exc:
+                except SustainedCheckError:
                     result_status = "failure"
                     result_payload = {
                         "latency_samples_ms": payload.get("latency_samples_ms", []),
                         "results": {},
-                        "error": str(exc),
+                        "error": (
+                            "브라우저 측 측정 결과 검증에 실패했습니다. "
+                            "전송량·시간·구간 합계를 확인한 뒤 다시 측정하세요."
+                        ),
                     }
             result = self._build_result(session, result_payload, status=result_status)
             try:
@@ -896,7 +899,16 @@ def create_sustained_blueprint(
         return normalize_ip(request.remote_addr)
 
     def error_response(exc: SustainedCheckError):
-        return jsonify({"error": str(exc)}), exc.status_code
+        messages = {
+            400: "HTTP 측정 요청이 올바르지 않습니다. 1개 연결과 지원 시간·방향을 확인하세요.",
+            403: "이 HTTP 측정 요청을 현재 접속 주소에서 처리할 수 없습니다.",
+            404: "HTTP 측정 세션 또는 결과를 찾을 수 없습니다.",
+            409: "HTTP 측정 요청이 현재 상태와 충돌했습니다.",
+            413: "HTTP 업로드 측정 조각이 허용 크기를 초과했습니다.",
+            500: "RESULT_READ_FAILED: HTTP 측정 결과를 안전하게 읽거나 생성할 수 없습니다.",
+            503: "HTTP 측정 기능을 사용할 수 없습니다.",
+        }
+        return jsonify({"error": messages.get(exc.status_code, "HTTP 측정 요청을 처리할 수 없습니다.")}), exc.status_code
 
     @blueprint.get("/network-check/latency")
     def latency():
@@ -1035,8 +1047,8 @@ def create_sustained_blueprint(
             excel_payload = build_sustained_excel(saved_result)
         except SustainedCheckError as exc:
             return error_response(exc)
-        except SustainedExcelError as exc:
-            return jsonify({"error": str(exc)}), 500
+        except SustainedExcelError:
+            return jsonify({"error": "HTTP 측정 Excel 결과 생성에 실패했습니다."}), 500
 
         response = send_file(
             BytesIO(excel_payload),

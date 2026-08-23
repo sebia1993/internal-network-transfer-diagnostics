@@ -675,7 +675,11 @@ class ProbeService:
         with self.lock:
             session = self._require_agent_session_locked(session_id, agent_id)
         if requested_status != "success":
-            self._finalize_session(session, "failed", str(payload.get("error", "TCP 클라이언트 측정에 실패했습니다."))[:500])
+            self._finalize_session(
+                session,
+                "failed",
+                "TCP 클라이언트가 측정 실패를 보고했습니다.",
+            )
             return self.session_status(session_id)
         if phase != session.next_phase():
             raise ProbeServiceError("TCP 측정 단계 순서가 올바르지 않습니다.", 409)
@@ -687,8 +691,12 @@ class ProbeService:
                 expected_duration_seconds=session.duration_seconds,
                 expected_stream_count=session.stream_count,
             )
-        except ProbeServiceError as exc:
-            self._finalize_session(session, "failed", str(exc))
+        except ProbeServiceError:
+            self._finalize_session(
+                session,
+                "failed",
+                "TCP 클라이언트 측정 결과 검증에 실패했습니다.",
+            )
             return self.session_status(session_id)
         deadline = self.clock() + 15.0
         with self.condition:
@@ -848,9 +856,15 @@ class ProbeService:
                     name=f"probe-{session.session_id[:8]}-{phase}",
                     daemon=True,
                 ).start()
-        except (OSError, ProbeProtocolError, ProbeServiceError, KeyError, TypeError, ValueError) as exc:
+        except (OSError, ProbeProtocolError, ProbeServiceError, KeyError, TypeError, ValueError):
             try:
-                send_frame(connection, {"type": "error", "error": str(exc)[:300]})
+                send_frame(
+                    connection,
+                    {
+                        "type": "error",
+                        "error": "TCP 제어 요청을 처리할 수 없습니다.",
+                    },
+                )
             except Exception:
                 pass
         finally:
@@ -1010,9 +1024,13 @@ class ProbeService:
         except ProbeCancelled:
             if session.status not in TERMINAL_STATUSES:
                 self._finalize_session(session, "cancelled", "TCP 측정이 취소되었습니다.")
-        except BaseException as exc:
+        except BaseException:
             if session.status not in TERMINAL_STATUSES:
-                self._finalize_session(session, "failed", str(exc)[:500])
+                self._finalize_session(
+                    session,
+                    "failed",
+                    "TCP 서버 측 측정에 실패했습니다.",
+                )
         finally:
             for sock in sockets.values():
                 self._close_socket(sock)

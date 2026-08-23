@@ -671,7 +671,7 @@ def test_probe_rejects_zero_byte_agent_stream_and_fails_session(tmp_path, stream
         )
 
         assert status["status"] == "failed"
-        assert "전송된 데이터가 없습니다" in status["error"]
+        assert "측정 결과 검증에 실패" in status["error"]
         assert status["persistence_complete"] is True
         assert gate.is_available() is True
     finally:
@@ -679,19 +679,15 @@ def test_probe_rejects_zero_byte_agent_stream_and_fails_session(tmp_path, stream
 
 
 @pytest.mark.parametrize(
-    ("result", "expected_error"),
+    "result",
     [
-        (None, "결과 형식이 올바르지 않습니다"),
-        (
-            build_agent_result(stream_count=1, duration_seconds=0),
-            "측정 시간이 올바르지 않습니다",
-        ),
+        None,
+        build_agent_result(stream_count=1, duration_seconds=0),
     ],
 )
 def test_probe_missing_or_invalid_duration_agent_result_fails_session(
     tmp_path,
     result,
-    expected_error,
 ):
     service, gate = build_service(tmp_path)
     assert service.start() is True
@@ -722,7 +718,7 @@ def test_probe_missing_or_invalid_duration_agent_result_fails_session(
         )
 
         assert status["status"] == "failed"
-        assert expected_error in status["error"]
+        assert "측정 결과 검증에 실패" in status["error"]
         assert status["persistence_complete"] is True
         assert gate.is_available() is True
     finally:
