@@ -4,6 +4,7 @@ __pycache__/
 *.log
 .pytest_cache/
 .venv/
+data/.internal-transfer-access-token
 build/
 dist/
 *.spec

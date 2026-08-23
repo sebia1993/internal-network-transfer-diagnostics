@@ -37,7 +37,8 @@ def test_windows_soak_workflow_runs_weekly_for_45_minutes():
     assert "analyze_windows_soak_summary.py" in workflow
     assert "--minimum-duration-minutes $env:SOAK_DURATION_MINUTES" in workflow
     assert "--output windows-soak-analysis.json" in workflow
-    assert "Windows stability analysis" in workflow
+    assert "render_windows_soak_summary.py" in workflow
+    assert "actions/upload-artifact@" in workflow
     assert '"30"' in workflow
     assert '"60"' in workflow
 

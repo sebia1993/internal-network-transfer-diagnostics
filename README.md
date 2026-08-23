@@ -1,217 +1,131 @@
 # Internal Network Transfer & Diagnostics
 
-[![Windows Stability Soak](https://github.com/sebia1993/-/actions/workflows/stability-windows.yml/badge.svg?branch=main)](https://github.com/sebia1993/-/actions/workflows/stability-windows.yml)
+[![PR Validation](https://github.com/sebia1993/internal-network-transfer-diagnostics/actions/workflows/pr-validation.yml/badge.svg?branch=main)](https://github.com/sebia1993/internal-network-transfer-diagnostics/actions/workflows/pr-validation.yml)
+[![Security Scan](https://github.com/sebia1993/internal-network-transfer-diagnostics/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/sebia1993/internal-network-transfer-diagnostics/actions/workflows/security.yml)
+[![Windows Stability Soak](https://github.com/sebia1993/internal-network-transfer-diagnostics/actions/workflows/stability-windows.yml/badge.svg?branch=main)](https://github.com/sebia1993/internal-network-transfer-diagnostics/actions/workflows/stability-windows.yml)
 
-**폐쇄망·사내 네트워크에서 파일을 전달하고, HTTP/TCP 처리량·지연·변동을 측정하며, 장시간 실행과 장애 복구까지 검증하는 Windows 네트워크 운영 보조 도구입니다.**
+내부망에서 진단 파일을 전달하고, 같은 구간의 HTTP/TCP 전송 상태를 비교하는 Windows 운영 보조 도구입니다.
 
-단순 파일 업로드 서버가 아니라 다음 두 문제를 함께 다룹니다.
+네트워크를 모르는 분에게는 이렇게 설명할 수 있습니다.
 
-1. 장애 분석에 필요한 PCAP·EVTX·문서·압축파일을 내부망에서 안전하게 전달
-2. 같은 경로에서 HTTP와 별도 TCP probe를 이용해 실제 전송 성능과 변동을 측정
+> “장애 분석 파일을 안전한 폴더 경계 안에서 전달하고, 전송이 느릴 때 웹 처리 문제인지 TCP 구간 문제인지 비교할 근거를 남기는 도구”
 
-> 이 도구는 신뢰된 내부망 사용을 전제로 합니다. 사용자 인증이 없는 인터넷 공개 서비스, 장비 인벤토리, 장애 티켓 시스템, 원격 실행 플랫폼을 목표로 하지 않습니다.
+이 저장소는 장비를 제어하거나 회선 품질을 인증하지 않습니다. 파일 전송, 측정, 결과 보존, 재시작 복구와 배포 검증에 범위를 제한합니다.
 
-## Portfolio Snapshot
+## 포트폴리오 요약
 
-| 관점 | 구현 내용 |
+| 질문 | 이 프로젝트가 보여주는 답 |
 |---|---|
-| 운영 문제 | 장애 분석 파일을 내부망에서 옮기는 과정과 전송 지연 원인 확인을 하나의 운영 흐름으로 통합 |
-| 네트워크 분석 | 동일 경로를 HTTP와 별도 TCP probe로 측정해 애플리케이션 계층 영향과 전송 계층 품질을 분리 관측 |
-| 안정성 설계 | bounded worker, single-flight 측정, 디스크 예약, graceful shutdown, fail-closed 종료 적용 |
-| 데이터 무결성 | temp → fsync → transaction marker → atomic replace → startup recovery 흐름으로 중간 실패 복구 |
-| 보안 경계 | 저장 경로 제한, 위험 확장자 차단, 확장자 우회를 고려한 Windows PE `MZ` 헤더 검사 |
-| 검증 | Python/JavaScript 회귀 검증과 Windows upload/TCP/restart soak, 기본 45분 안정성 검증 수행 |
-| 배포 | Python 설치 없이 실행 가능한 Windows self-contained ZIP과 SHA-256/SBOM/security manifest 생성 |
+| 어떤 문제를 해결하는가? | 내부망 장애 분석 파일 전달과 전송 상태 확인을 한 화면에 묶었습니다. |
+| 네트워크 전문성이 어디에 드러나는가? | HTTP와 별도 TCP 경로를 나눠 측정하고, 평균값뿐 아니라 1초 표본·변동·부분 실패를 보존합니다. |
+| 운영 안정성은 어떻게 다루는가? | worker 상한, single-flight 측정, 디스크 예약, graceful shutdown, transaction 기반 재시작 복구를 적용했습니다. |
+| 보안 경계는 무엇인가? | 비루프백 HTTP 인증·CSRF, TCP HMAC·재전송 방지, 저장 경로 제한, 위험 파일 차단을 적용했습니다. |
+| 품질을 어떻게 증명하는가? | Windows CI, 회귀·장애 주입 테스트, 45분 합성 soak, CodeQL, secret scan, ZIP/SHA/SBOM 검증을 자동화했습니다. |
 
-**기술 스택:** Python · Flask · TCP networking · JavaScript · pytest · Excel/JSON/CSV · GitHub Actions · Windows packaging
+기술 스택: Python, Flask, TCP sockets, JavaScript, pytest, PowerShell, GitHub Actions, PyInstaller, CSV/JSON/Excel, CycloneDX
 
-이 프로젝트에서 보여주려는 핵심 역량은 단순 파일 서버 구현이 아니라 **네트워크 장애 분석 관점의 측정 설계, 장시간 운영 안정성, 실패 복구와 데이터 무결성, 운영 환경에 맞춘 안전 경계 설정**입니다.
+## 사용 흐름
 
-## 한눈에 보기
+1. 운영자가 Windows 서버를 실행합니다.
+2. 같은 PC에서는 인증 없이 루프백 화면을 열 수 있습니다.
+3. 다른 PC에서는 서버가 만든 접근 토큰으로 로그인합니다.
+4. 진단 파일을 업로드하거나 HTTP 전송 측정을 실행합니다.
+5. TCP 비교가 필요하면 화면에서 일회용 등록 토큰이 든 Windows 클라이언트 ZIP을 받습니다.
+6. 결과를 화면, JSON, CSV 또는 Excel로 확인합니다.
 
-| 영역 | 기능 |
-|---|---|
-| 파일 전달 | 브라우저 업로드 / 직접 다운로드 링크 / 메모 |
-| 저장 경계 | 설정된 `STORAGE_ROOT` 하위만 허용 |
-| 위험 파일 차단 | 실행파일·스크립트·바로가기·드라이버·설치 패키지·매크로 문서·디스크 이미지 차단 |
-| PE 우회 방지 | 확장자와 별개로 Windows `MZ` 헤더 검사 |
-| HTTP 측정 | 업/다운로드 처리량, 데이터량 또는 시간 기준 |
-| TCP 측정 | 별도 TCP probe 서버/클라이언트로 전송 성능 측정 |
-| 결과 | Mbps / MB/s / 변동률 / 1초 표본 / Excel·JSON·CSV |
-| 동시성 | 웹 요청 최대 32, 업로드 최대 4, 측정 single-flight |
-| 저장 안정성 | temp + fsync + atomic replace, transaction marker 기반 복구 |
-| 디스크 보호 | 최소 여유공간 + 진행 중 업로드 용량 예약 |
-| 종료 | bounded graceful shutdown 후 fail-closed 종료 |
-| 장시간 검증 | Windows upload/TCP/restart soak + 자원 추세 분석 |
-| 배포 | Windows self-contained ZIP, hash-pinned dependency, SHA-256/SBOM/security manifest |
-
-## 해결하려 한 운영 문제
-
-현장에서 파일 전달과 네트워크 품질 확인은 자주 같이 발생합니다. 예를 들어 로그·PCAP을 다른 PC로 옮겨야 하는데 전송 자체가 느리면 **파일 크기 문제인지, HTTP 경로 문제인지, 네트워크 자체의 처리량 문제인지** 구분해야 합니다.
-
-이 프로젝트는 다음을 한 도구 안에서 분리해 관측합니다.
-
-- 내부 파일 전달이 실제로 가능한가
-- 브라우저 HTTP 업/다운로드의 처리량은 얼마인가
-- 동일 경로에서 별도 TCP 측정 결과는 어떤가
-- 평균 속도뿐 아니라 1초 단위 변동이 큰가
-- 장시간 실행 중 CSV/JSON/업로드 transaction이 손상되지 않는가
-- 프로세스 재시작이나 중간 실패 후 저장 상태가 일관되게 복구되는가
+화면별 역할과 합성 시나리오는 [UI 안내](docs/UI_WALKTHROUGH_KO.md)에 정리했습니다.
 
 ## 아키텍처
 
 ```mermaid
 flowchart LR
-    C["Browser / Operator PC"] -->|"HTTP"| WEB["Bounded Flask Server"]
-    C -->|"TCP Probe Client"| TCP["TCP Probe Server"]
-
-    WEB --> UP["Upload Transaction"]
-    WEB --> HTTP["HTTP Measurement"]
-    WEB --> OPS["Read-only Operations Summary"]
-
-    TCP --> TM["TCP Measurement"]
-
-    UP --> STORE["Storage Root"]
-    HTTP --> RESULT["Result Storage"]
-    TM --> RESULT
-    RESULT --> CSV["CSV / JSON / Excel"]
+    O["운영자 브라우저"] -->|"로그인 세션 + CSRF / Bearer"| W["Bounded Flask 서버"]
+    A["Windows TCP 클라이언트"] -->|"일회용 등록 + Agent Bearer"| W
+    A -->|"HMAC-SHA256 + timestamp + nonce"| T["TCP 측정 서버"]
+    W --> U["파일 전송"]
+    W --> H["HTTP 측정"]
+    T --> P["TCP 측정"]
+    U --> S["허용된 저장 루트"]
+    H --> R["JSON / CSV / Excel"]
+    P --> R
+    R --> X["transaction + 재시작 복구"]
 ```
 
-상세 구성요소와 상태 소유권은 [ARCHITECTURE.md](docs/ARCHITECTURE.md)를 참고하십시오.
+상세 책임과 상태 소유권은 [아키텍처 문서](docs/ARCHITECTURE.md)를 참고하세요.
 
-## 네트워크 측정
+## 주요 기능
 
-### HTTP 전송 측정
+### 파일 전달
 
-브라우저와 서버 사이의 실제 HTTP 경로를 사용합니다.
+- 브라우저 업로드와 직접 다운로드 링크
+- `STORAGE_ROOT` 밖의 절대 경로·상위 경로 이동 차단
+- 실행파일, 스크립트, 매크로 문서, 설치 패키지, 디스크 이미지 차단
+- 확장자를 바꾼 Windows PE 파일의 `MZ` 헤더 검사
+- 업로드 최대 4건, 일반 웹 worker 최대 32개
+- 진행 중 요청을 포함한 디스크 공간 예약과 최소 여유공간 보호
 
-**데이터량 기준**
+### HTTP/TCP 비교 측정
 
-- 10 / 50 / 100 / 500 / 1024MB
-- 업로드 / 다운로드 / 양방향
-- 평균 Mbps·MB/s
-- 전송 시간과 1GB 예상 시간
+- HTTP: 데이터량 또는 10/30초 시간 기준 업로드·다운로드 측정
+- TCP: 전용 Windows 클라이언트와 별도 포트에서 1개 또는 4개 stream 측정
+- 평균·최저·최고·변동과 1초 표본 저장
+- 동시에 하나의 고부하 측정만 허용해 측정끼리 결과를 왜곡하지 않도록 제한
+- 한 방향 실패 시 완료된 반대 방향 결과를 부분 완료로 보존
 
-**시간 기준**
+측정값의 의미는 [측정 모델](docs/MEASUREMENT_MODEL.md)에 설명했습니다.
 
-- 워밍업 후 10초 또는 30초 본 측정
-- 1초 단위 속도 표본
-- 최근 3초 속도
-- 평균·최저·최고·변동률
-- 한 방향 실패 시 완료된 방향을 `부분 완료`로 보존
-- 서버 전체에서 동시에 하나의 시간 기준 측정만 허용
+### 실패 복구
 
-### TCP 전송 성능 측정
-
-HTTP 처리 계층과 별도로 TCP probe 서버/클라이언트를 사용해 전송 성능을 확인합니다.
+파일과 결과를 단순히 쓴 뒤 성공으로 간주하지 않습니다.
 
 ```text
-Operator PC
-   ↓ dedicated TCP client
-TCP probe port
-   ↓
-Server-side probe engine
-   ↓
-result JSON / CSV / Excel
+임시 파일 → flush/fsync → intent marker → atomic replace → marker 정리
+                                 ↓ 중단
+                         다음 시작에서 재조정
 ```
 
-HTTP와 TCP 결과를 함께 보면 브라우저·HTTP 애플리케이션 계층의 영향과 네트워크 전송 계층의 차이를 비교할 수 있습니다.
+복구할 수 없는 모호한 상태는 정상으로 추정하지 않고 새 작업을 차단합니다.
 
-상세 측정 상태·partial result·single-flight 정책은 [MEASUREMENT_MODEL.md](docs/MEASUREMENT_MODEL.md)에 정리했습니다.
+## 인증과 비밀 관리
 
-## 파일 전달 안전 경계
+기본 설정 `HOST=0.0.0.0`에서는 루프백이 아닌 요청에 인증이 필요합니다.
 
-### 저장 경로
+- 브라우저: 접근 토큰 로그인 + cookie session + CSRF
+- API 자동화: master Bearer token, cookie를 사용하지 않으므로 CSRF 면제
+- TCP 등록: 짧은 수명의 1회용 enrollment token
+- TCP 제어: agent/session별 HMAC-SHA256, 60초 시간 범위와 nonce 재사용 차단
+- 접근 토큰: `INTERNAL_TRANSFER_ACCESS_TOKEN` 환경 변수 또는 소유자 전용 파일
+- 금지: 토큰 값을 URL, CLI 인수, 로그, Git 저장 파일에 기록
 
-업로드 하위 경로는 `STORAGE_ROOT` 아래로만 제한합니다.
+최초 실행 시 기본 토큰 파일은 `data/.internal-transfer-access-token`에 만들어집니다. POSIX에서는 `0600`이 아니면 시작을 거부합니다. Windows에서는 파일을 서버 계정만 읽을 수 있는 위치와 ACL로 보호해야 합니다.
 
-```text
-허용: logs/2026/trace.pcap
-차단: C:\temp\trace.pcap
-차단: ..\..\trace.pcap
-```
+중요: 내장 HTTP/TCP는 암호화를 제공하지 않습니다. 인증은 무단 사용을 줄이지만 도청을 막지 못합니다. 신뢰할 수 있는 내부망·VPN에서 사용하고, 신뢰 경계를 넘으면 TLS 역방향 프록시를 적용하세요.
 
-### 업로드 파일 정책
-
-운영 보조 파일 전달을 목적으로 하므로 다음 계열은 차단합니다.
-
-- 실행파일 / 스크립트 / 바로가기
-- 드라이버 / 설치 패키지
-- 매크로 포함 Office 문서
-- 디스크 이미지
-- 확장자를 바꾼 Windows PE 파일
-
-PCAP, EVTX, 일반 문서와 ZIP 같은 압축파일은 전달할 수 있습니다. 단, **압축파일 내부 콘텐츠를 검사하는 보안 게이트웨이는 아닙니다.**
-
-### 디스크·동시성 보호
-
-- 서버에 최소 1GB 여유공간을 남김
-- 진행 중 업로드의 아직 기록되지 않은 예상 용량도 예약량에 포함
-- 업로드 중 주기적으로 실제 여유공간 재확인
-- 업로드 동시 처리 최대 4
-- 일반 웹 요청 worker 최대 32
-- 처리 한도 초과는 503, 공간 부족은 507로 거절
-
-## 장애 복구 설계
-
-파일과 측정 결과는 단순 `write()` 후 성공으로 간주하지 않습니다.
-
-```mermaid
-flowchart TD
-    W["Write temp"] --> F["Flush / fsync"]
-    F --> M["Transaction / intent marker"]
-    M --> R["Atomic replace / commit"]
-    R --> C["Cleanup marker"]
-    C --> S["Committed state"]
-
-    X["Crash / restart"] --> REC["Startup recovery"]
-    REC --> S
-```
-
-업로드, sustained HTTP, TCP 결과에는 각각 transaction/intent와 startup recovery 경계가 있습니다. 모호한 상태를 정상 결과로 조용히 승격하지 않고, 복구 가능한 상태와 실패 상태를 구분합니다.
-
-## bounded server와 종료 정책
-
-대용량 파일 전송에 단순한 전체 요청 timeout을 적용하면 정상 요청을 잘못 끊을 수 있습니다. 그래서 서버는 **데이터가 흐르는 정상 전송과 아무 진행이 없는 연결을 구분**합니다.
-
-- inactive connection 제한
-- worker 상한
-- 신규 요청 중단 후 진행 요청에 종료 grace 제공
-- 종료 시 measurement 상태 정리
-- bounded grace 이후에도 worker가 남으면 lock/진단 상태를 보존한 뒤 fail-closed 종료
-- 다음 시작에서 transaction/CSV 무결성 복구
-
-## Operations Summary
-
-운영 화면에는 서버 상태와 최근 측정 결과를 요약해 보여주지만, 이는 **장비 인벤토리나 장애 티켓 시스템이 아닙니다.**
-
-목적은 다음과 같습니다.
-
-- 서버가 저장 가능한 상태인지
-- TCP probe가 사용 가능한지
-- 최근 HTTP/TCP 측정이 어떤 상태였는지
-- 복구 또는 저장 오류가 있는지
+자세한 위협·제한·운영 조치는 [보안 모델](docs/SECURITY_MODEL.md)에 있습니다.
 
 ## Windows 실행
 
-일반 사용자는 GitHub Release의 Windows ZIP을 사용합니다.
+[GitHub Releases](https://github.com/sebia1993/internal-network-transfer-diagnostics/releases)에서 다음 자산을 받습니다.
 
 ```text
-internal-upload_v0.5.3_windows.zip
+internal-upload_v0.6.0_windows.zip
+internal-upload_v0.6.0_windows.zip.sha256
+internal-upload_v0.6.0_sbom.cdx.json
 ```
 
-1. ZIP을 완전히 압축 해제합니다.
-2. `start_internal_upload.cmd`를 실행합니다.
-3. 콘솔에 표시된 실제 HTTP 주소를 엽니다.
-4. 다른 PC에서 사용할 경우 서버 PC의 허가된 내부 IP와 방화벽 정책을 확인합니다.
+1. SHA-256을 확인합니다.
+2. ZIP을 완전히 압축 해제합니다.
+3. `start_internal_upload.cmd`를 실행합니다.
+4. 콘솔에 표시된 주소를 브라우저에서 엽니다.
+5. 다른 PC에서는 서버의 접근 토큰 파일 값을 로그인 화면에 입력합니다.
 
-프로그램은 **Windows 방화벽을 자동 수정하거나 관리자 권한을 요구하지 않습니다.** 포트 허용이 필요하면 조직 정책에 따라 별도로 처리합니다.
+프로그램은 Windows 방화벽을 자동 변경하거나 권한 상승을 요청하지 않습니다.
 
-## 주요 설정
+## 설정
 
 ```ini
 [app]
-CONFIG_VERSION=2
+CONFIG_VERSION=3
 HOST=0.0.0.0
 PORT=8000
 BASE_URL=
@@ -222,89 +136,73 @@ RECENT_LIMIT=50
 [network_probe]
 ENABLED=true
 PORT=5201
+
+[security]
+ACCESS_TOKEN_FILE=data/.internal-transfer-access-token
+SESSION_TTL_MINUTES=480
+ENROLLMENT_TOKEN_TTL_SECONDS=300
 ```
 
-잘못된 설정을 임의 기본값으로 조용히 대체하지 않고 항목과 허용 범위를 안내한 뒤 종료합니다.
+잘못된 명시 설정은 조용히 기본값으로 대체하지 않고 허용 범위를 안내한 뒤 시작을 중단합니다. `CONFIG_VERSION=2`에서 `3`으로 올라갈 때 사용자가 끈 TCP 측정 설정은 유지합니다.
 
-## 검증 체계
+## 검증
 
-소스 검증은 Python·JavaScript·fault recovery를 함께 확인합니다.
+| 검증 | 실행 환경 | 확인하는 것 | 확인하지 못하는 것 |
+|---|---|---|---|
+| 회귀·장애 주입 | Windows CI와 로컬 개발 환경 | 라우트, 복구, 인증 실패, HMAC·replay, 파일/결과 무결성 | 실제 조직의 장비·보안 제품 호환성 |
+| Windows 패키지 | GitHub-hosted Windows runner | EXE self-check, ZIP 구조, SHA, SBOM, security manifest | 코드 서명된 publisher 신원 |
+| 45분 soak | GitHub-hosted Windows runner의 합성 파일/루프백 TCP | 업로드·TCP 자체 점검·재시작과 후처리, 자원 추세 | 현장 회선 속도, 장기 무중단 운영 전체 |
+| CodeQL default setup | GitHub Actions | Python·JavaScript의 알려진 코드 보안 패턴 | 모든 취약점·동적 운영 공격 |
+| tracked secret scan | GitHub Actions | Git 추적 파일의 대표 비밀 형식 | 모든 비밀 형식·Git 이력 전체 |
 
-```text
-compileall
-   ↓
-JavaScript syntax check
-   ↓
-pytest regression suite
-   ↓
-stability fault suite
-   ↓
-pip dependency check
-```
+Step Summary에는 크기가 제한된 Markdown만 게시하며, 원시 soak JSON과 분석 JSON은 workflow artifact로 보존합니다. 자동 검증의 판정 기준과 한계는 [검증 보고서](docs/VALIDATION_REPORT.md)에 있습니다.
 
-Windows 안정성 workflow는 별도로 upload/TCP/restart soak를 수행하고 자원 추세를 분석합니다. 기본 스케줄 검증은 45분입니다.
-
-Release 빌드는 다음 보안·재현성 자료를 포함합니다.
-
-- SHA-256
-- SBOM
-- security manifest
-- security review
-- hash-pinned Windows dependencies
-
-자동 검증의 범위와 한계는 [VALIDATION_REPORT.md](docs/VALIDATION_REPORT.md)를 참고하십시오.
-
-## 개발 검증
+## 로컬 개발 검증
 
 ```powershell
-python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+python -m compileall access_security.py app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+node --check static/security.js
 node --check static/network_check.js
 node --check static/network_sustained.js
 node --check static/network_probe.js
 node --check static/throughput_chart.js
 node --check static/operations_dashboard.js
 python -m pytest -q
+python tools/scan_tracked_secrets.py
 python tools/run_stability_fault_suite.py
+python -m pip check
 ```
 
-장시간 Windows 검증:
+Windows 합성 soak:
 
 ```powershell
 python tools/run_windows_stability_soak.py --duration-minutes 45 --summary-path windows-soak-summary.json
 python tools/analyze_windows_soak_summary.py windows-soak-summary.json --minimum-duration-minutes 45 --output windows-soak-analysis.json
+python tools/render_windows_soak_summary.py --summary windows-soak-summary.json --analysis windows-soak-analysis.json --output windows-soak-step-summary.md
 ```
 
-개발 규칙은 [DEVELOPMENT.md](DEVELOPMENT.md)를 참고하십시오.
+## 알려진 한계
 
-## 보안과 한계
-
-이 프로젝트의 안전 경계는 [SECURITY_MODEL.md](docs/SECURITY_MODEL.md)에 자세히 정리했습니다.
-
-주요 잔여 위험은 다음과 같습니다.
-
-- 사용자 인증이 없는 신뢰 내부망 전제
-- unsigned Windows binary
-- 업로드 파일 크기 자체에는 고정 상한이 없음
-- 압축파일 내부 콘텐츠는 검사하지 않음
-- TCP client가 측정 완료를 기다리는 동안 장시간 연결될 수 있음
-
-따라서 인터넷에 직접 노출하거나 불특정 사용자가 접근하는 환경을 대상으로 하지 않습니다.
+- 인터넷 공개형·다중 사용자 파일 공유 서비스가 아닙니다.
+- HTTP/TCP 데이터 기밀성을 제공하지 않습니다.
+- Windows EXE는 코드 서명되지 않았습니다.
+- 업로드 전체 크기의 고정 상한과 압축파일 내부 검사는 없습니다.
+- 측정값은 endpoint·OS·브라우저·경로의 영향을 함께 받는 관측값이며 회선 SLA 판정이 아닙니다.
+- UDP 손실·지터, 장비 인벤토리, 장애 티켓, 원격 명령 실행은 범위 밖입니다.
+- 합성 CI 자료는 실제 현장 성과 수치가 아닙니다.
 
 ## 문서
 
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — 구성요소와 데이터 흐름
-- [MEASUREMENT_MODEL.md](docs/MEASUREMENT_MODEL.md) — HTTP/TCP 측정 모델
-- [SECURITY_MODEL.md](docs/SECURITY_MODEL.md) — 파일·네트워크·저장 안전 경계
-- [VALIDATION_REPORT.md](docs/VALIDATION_REPORT.md) — 자동 검증 범위와 한계
-- [PROJECT_DIAGNOSTIC_AND_IMPROVEMENT_PLAN_KO.md](docs/PROJECT_DIAGNOSTIC_AND_IMPROVEMENT_PLAN_KO.md) — 상세 진단·개선 기록
-- [CHANGELOG.md](CHANGELOG.md) — 버전 이력
+- [아키텍처](docs/ARCHITECTURE.md)
+- [UI 안내와 합성 시나리오](docs/UI_WALKTHROUGH_KO.md)
+- [측정 모델](docs/MEASUREMENT_MODEL.md)
+- [보안 모델](docs/SECURITY_MODEL.md)
+- [검증 보고서](docs/VALIDATION_REPORT.md)
+- [v0.5.x 진단·개선 기록](docs/PROJECT_DIAGNOSTIC_AND_IMPROVEMENT_PLAN_KO.md)
+- [개발 가이드](DEVELOPMENT.md)
+- [변경 이력](CHANGELOG.md)
+- [릴리스 준비 기록](RELEASE_NOTES.md)
 
-## 범위 밖
+## 라이선스
 
-- 인터넷 공개형 파일 공유 서비스
-- 사용자/권한 관리 시스템
-- 장비 인벤토리
-- 장애 티켓 관리
-- 업로드 파일 실행
-- 방화벽 자동 변경
-- 원격 명령 실행
+[MIT License](LICENSE)

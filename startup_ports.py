@@ -19,7 +19,8 @@ from runtime_stability import durable_replace
 APP_ID = "internal-upload"
 APP_SECTION = "app"
 PROBE_SECTION = "network_probe"
-CURRENT_CONFIG_VERSION = 2
+SECURITY_SECTION = "security"
+CURRENT_CONFIG_VERSION = 3
 PORT_SEARCH_LIMIT = 99
 DEFAULT_APP_SETTINGS = {
     "CONFIG_VERSION": str(CURRENT_CONFIG_VERSION),
@@ -34,10 +35,17 @@ DEFAULT_PROBE_SETTINGS = {
     "ENABLED": "true",
     "PORT": "5201",
 }
+DEFAULT_SECURITY_SETTINGS = {
+    "ACCESS_TOKEN_FILE": "data/.internal-transfer-access-token",
+    "SESSION_TTL_MINUTES": "480",
+    "ENROLLMENT_TOKEN_TTL_SECONDS": "300",
+}
 CONFIG_VALUE_GUIDANCE = (
     "주요 키 허용값: [app] PORT=1~65535, RECENT_LIMIT=1~10000, "
     "BASE_URL=비어 있음 또는 http(s) URL; [network_probe] "
-    "ENABLED=true/false, yes/no, on/off, 1/0, PORT=1~65535."
+    "ENABLED=true/false, yes/no, on/off, 1/0, PORT=1~65535; [security] "
+    "ACCESS_TOKEN_FILE=비어 있지 않은 파일 경로, SESSION_TTL_MINUTES=5~1440, "
+    "ENROLLMENT_TOKEN_TTL_SECONDS=30~3600."
 )
 
 FIREWALL_ALLOWED = "allowed"
@@ -480,6 +488,32 @@ def _validate_config_values(parser: ConfigParser, path: Path) -> None:
         minimum=1,
         maximum=65535,
     )
+    token_file = _option_value(parser, SECURITY_SECTION, "ACCESS_TOKEN_FILE")
+    if token_file is not None and (
+        not token_file or any(ord(character) < 32 for character in token_file)
+    ):
+        _raise_invalid_config_value(
+            path,
+            SECURITY_SECTION,
+            "ACCESS_TOKEN_FILE",
+            "비어 있지 않은 파일 경로",
+        )
+    _validate_integer_option(
+        parser,
+        path,
+        SECURITY_SECTION,
+        "SESSION_TTL_MINUTES",
+        minimum=5,
+        maximum=1440,
+    )
+    _validate_integer_option(
+        parser,
+        path,
+        SECURITY_SECTION,
+        "ENROLLMENT_TOKEN_TTL_SECONDS",
+        minimum=30,
+        maximum=3600,
+    )
     _validate_integer_option(
         parser,
         path,
@@ -542,6 +576,8 @@ def read_config_parser(
             parser.add_section(APP_SECTION)
         if not parser.has_section(PROBE_SECTION):
             parser.add_section(PROBE_SECTION)
+        if not parser.has_section(SECURITY_SECTION):
+            parser.add_section(SECURITY_SECTION)
     return parser
 
 
@@ -593,11 +629,25 @@ def config_requires_probe_enable_migration(config_path: str | os.PathLike[str]) 
     return version < CURRENT_CONFIG_VERSION
 
 
+def config_requires_legacy_probe_enable(config_path: str | os.PathLike[str]) -> bool:
+    path = Path(config_path).resolve()
+    if not path.exists():
+        return False
+    parser = _read_parser(path)
+    raw_version = _get_option(parser[APP_SECTION], "CONFIG_VERSION", "0")
+    try:
+        version = int(raw_version)
+    except ValueError:
+        version = 0
+    return version < 2
+
+
 def migrate_config(config_path: str | os.PathLike[str]) -> ConfigMigrationResult:
     path = Path(config_path).resolve()
     parser = _read_parser(path)
     app_section = parser[APP_SECTION]
     probe_section = parser[PROBE_SECTION]
+    security_section = parser[SECURITY_SECTION]
     raw_version = _get_option(app_section, "CONFIG_VERSION", "0")
     try:
         previous_version = int(raw_version)
@@ -609,10 +659,17 @@ def migrate_config(config_path: str | os.PathLike[str]) -> ConfigMigrationResult
 
     _ensure_defaults(app_section, DEFAULT_APP_SETTINGS)
     _ensure_defaults(probe_section, DEFAULT_PROBE_SETTINGS)
+    _ensure_defaults(security_section, DEFAULT_SECURITY_SETTINGS)
     raw_enabled = _get_option(probe_section, "ENABLED", "true").strip().casefold()
-    probe_enabled_changed = raw_enabled not in {"1", "yes", "true", "on"}
+    probe_enabled_changed = previous_version < 2 and raw_enabled not in {
+        "1",
+        "yes",
+        "true",
+        "on",
+    }
     _set_option(app_section, "CONFIG_VERSION", str(CURRENT_CONFIG_VERSION))
-    _set_option(probe_section, "ENABLED", "true")
+    if previous_version < 2:
+        _set_option(probe_section, "ENABLED", "true")
     _write_parser(path, parser)
     return ConfigMigrationResult(previous_version, CURRENT_CONFIG_VERSION, probe_enabled_changed)
 

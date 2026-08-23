@@ -96,7 +96,8 @@ def test_build_client_package_contains_only_autoconnect_client_files(tmp_path):
     bundle = make_client_bundle(tmp_path)
     server_url = "http://server-pc:8000"
 
-    package = build_client_package(bundle, server_url)
+    enrollment_token = "enr_v1_" + ("x" * 44)
+    package = build_client_package(bundle, server_url, enrollment_token=enrollment_token)
 
     assert package.download_name == "internal-upload-client_server-pc.zip"
     assert package.root_name == "InternalUpload_Client_server-pc"
@@ -121,9 +122,10 @@ def test_build_client_package_contains_only_autoconnect_client_files(tmp_path):
         )
     assert executable == b"MZ-client-test"
     assert config == {
-        "schema_version": 1,
+        "schema_version": 2,
         "server_url": server_url,
         "client_version": APP_VERSION,
+        "enrollment_token": enrollment_token,
     }
     assert manifest["executable"] == "NetworkProbeClient.exe"
     assert manifest["executable_sha256"] == hashlib.sha256(executable).hexdigest()
@@ -141,6 +143,7 @@ def test_build_client_package_contains_only_autoconnect_client_files(tmp_path):
     assert "TCP 전송 성능 측정" in readme
     assert "config.ini" in readme
     assert "TCP 측정 포트는 서버가 자동으로 전달" in readme
+    assert "한 번만" in readme
     assert "InternalUploadServer.exe" not in readme
 
 

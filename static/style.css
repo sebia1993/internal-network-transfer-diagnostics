@@ -325,6 +325,7 @@ label span {
 
 input[type="file"],
 input[type="text"],
+input[type="password"],
 select,
 textarea {
   width: 100%;
@@ -337,6 +338,35 @@ textarea {
 
 textarea {
   resize: vertical;
+}
+
+.logout-form {
+  display: inline-flex;
+}
+
+.logout-form .secondary {
+  min-height: 28px;
+  padding: 4px 10px;
+}
+
+.login-page {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: min(460px, 100%);
+}
+
+.login-card h1 {
+  margin: 0 0 12px;
+  font-size: 24px;
+}
+
+.login-card .muted {
+  margin: 18px 0 0;
 }
 
 .workflow-hint {

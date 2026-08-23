@@ -907,6 +907,13 @@ def sustained_client(tmp_path):
     return app.test_client(), tmp_path
 
 
+def remote_auth(tmp_path: Path) -> dict[str, str]:
+    token = (tmp_path / "data/.internal-transfer-access-token").read_text(
+        encoding="ascii"
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_sustained_routes_validate_and_cancel(sustained_client):
     client, tmp_path = sustained_client
     invalid = client.post(
@@ -960,33 +967,40 @@ def test_sustained_routes_validate_and_cancel(sustained_client):
 
 
 def test_sustained_result_download_is_limited_to_origin_ip(sustained_client):
-    client, _ = sustained_client
+    client, tmp_path = sustained_client
+    headers = remote_auth(tmp_path)
     started = client.post(
         "/network-check/sustained/sessions",
         json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     session_id = started.json["session_id"]
     client.post(
         f"/network-check/sustained/sessions/{session_id}/cancel",
         json={},
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
 
     allowed = client.get(
         f"/network-check/sustained/results/{session_id}.json",
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     denied = client.get(
         f"/network-check/sustained/results/{session_id}.json",
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.11"},
     )
     excel_allowed = client.get(
         f"/network-check/sustained/results/{session_id}.xlsx",
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     excel_denied = client.get(
         f"/network-check/sustained/results/{session_id}.xlsx",
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.11"},
     )
 
@@ -1010,15 +1024,18 @@ def test_sustained_json_download_reads_authorized_result_once(
     monkeypatch,
 ):
     client, tmp_path = sustained_client
+    headers = remote_auth(tmp_path)
     started = client.post(
         "/network-check/sustained/sessions",
         json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     session_id = started.json["session_id"]
     client.post(
         f"/network-check/sustained/sessions/{session_id}/cancel",
         json={},
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     result_path = tmp_path / "data" / "network_check_results" / f"{session_id}.json"
@@ -1036,6 +1053,7 @@ def test_sustained_json_download_reads_authorized_result_once(
 
     response = client.get(
         f"/network-check/sustained/results/{session_id}.json",
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
 
@@ -1044,6 +1062,7 @@ def test_sustained_json_download_reads_authorized_result_once(
     assert result_read_count == 1
     missing = client.get(
         f"/network-check/sustained/results/{'f' * 32}.json",
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     assert missing.status_code == 404
@@ -1055,15 +1074,18 @@ def test_sustained_json_download_returns_safe_error_when_result_read_fails(
     monkeypatch,
 ):
     client, tmp_path = sustained_client
+    headers = remote_auth(tmp_path)
     started = client.post(
         "/network-check/sustained/sessions",
         json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     session_id = started.json["session_id"]
     client.post(
         f"/network-check/sustained/sessions/{session_id}/cancel",
         json={},
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     result_path = tmp_path / "data" / "network_check_results" / f"{session_id}.json"
@@ -1078,6 +1100,7 @@ def test_sustained_json_download_returns_safe_error_when_result_read_fails(
 
     response = client.get(
         f"/network-check/sustained/results/{session_id}.json",
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
 
@@ -1094,15 +1117,18 @@ def test_sustained_json_download_returns_safe_error_for_invalid_utf8(
     sustained_client,
 ):
     client, tmp_path = sustained_client
+    headers = remote_auth(tmp_path)
     started = client.post(
         "/network-check/sustained/sessions",
         json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     session_id = started.json["session_id"]
     client.post(
         f"/network-check/sustained/sessions/{session_id}/cancel",
         json={},
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
     result_path = tmp_path / "data" / "network_check_results" / f"{session_id}.json"
@@ -1110,6 +1136,7 @@ def test_sustained_json_download_returns_safe_error_for_invalid_utf8(
 
     response = client.get(
         f"/network-check/sustained/results/{session_id}.json",
+        headers=headers,
         environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
 

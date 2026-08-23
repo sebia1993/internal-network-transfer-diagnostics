@@ -84,6 +84,9 @@ def test_repository_runtime_templates_are_sanitized_and_header_only():
     assert config.recent_limit == 50
     assert config.network_probe_enabled is True
     assert config.network_probe_port == 5201
+    assert config.access_token_file == "data/.internal-transfer-access-token"
+    assert config.access_session_ttl_minutes == 480
+    assert config.enrollment_token_ttl_seconds == 300
 
 
 @pytest.fixture()
@@ -644,9 +647,14 @@ def test_delete_requires_allowed_ip(app_client):
     client, config, _ = app_client
     post_file(client, filename="delete.txt", content=b"delete me")
     row = read_upload_log(config)[0]
+    access_token = (config.app_root / "data/.internal-transfer-access-token").read_text(
+        encoding="ascii"
+    )
+    auth = {"Authorization": f"Bearer {access_token}"}
 
     denied = client.post(
         f"/delete/{row['upload_id']}",
+        headers=auth,
         environ_overrides={"REMOTE_ADDR": "10.10.10.6"},
     )
     assert denied.status_code == 403
@@ -655,6 +663,7 @@ def test_delete_requires_allowed_ip(app_client):
 
     allowed = client.post(
         f"/delete/{row['upload_id']}",
+        headers=auth,
         environ_overrides={"REMOTE_ADDR": "10.10.10.5"},
     )
     assert allowed.status_code == 302
@@ -1265,6 +1274,7 @@ def test_windows_release_workflow_checks_all_release_runtime_modules_and_scripts
         "throughput_chart.js syntax check",
         "operations_dashboard.js syntax check",
         "Python regression tests",
+        "Tracked secret scan",
         "Stability fault suite",
         "Python dependency check",
     ):
@@ -1283,7 +1293,8 @@ def test_windows_release_workflow_checks_all_release_runtime_modules_and_scripts
     assert "must be an annotated tag" in workflow
     assert "--verify-tag" in workflow
     assert "--target $env:GITHUB_SHA" not in workflow
-    assert "사내 업로드 사용성 및 안정성 개선" in workflow
+    assert "내부망 파일 전송 및 네트워크 진단" in workflow
+    assert "_sbom.cdx.json" in workflow
 
 
 def test_csv_header_is_utf8_sig(app_client):
@@ -1941,7 +1952,9 @@ def test_release_zip_verifier_accepts_expected_structure(tmp_path):
         encoding="utf-8",
     )
     (package_root / "config.ini").write_text(
-        "[app]\nCONFIG_VERSION=2\n\n[network_probe]\nENABLED=true\nPORT=5201\n",
+        "[app]\nCONFIG_VERSION=3\n\n[network_probe]\nENABLED=true\nPORT=5201\n\n"
+        "[security]\nACCESS_TOKEN_FILE=data/.internal-transfer-access-token\n"
+        "SESSION_TTL_MINUTES=480\nENROLLMENT_TOKEN_TTL_SECONDS=300\n",
         encoding="utf-8",
     )
     for name, content in (

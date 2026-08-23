@@ -14,9 +14,10 @@ def test_probe_client_loads_validated_adjacent_json_config(tmp_path):
     config.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "server_url": "http://SERVER-PC:8123",
                 "client_version": APP_VERSION,
+                "enrollment_token": "enr_v1_" + ("x" * 44),
             }
         ),
         encoding="utf-8",
@@ -30,8 +31,8 @@ def test_probe_client_loads_validated_adjacent_json_config(tmp_path):
     [
         {},
         {"schema_version": 2, "server_url": "http://server-pc:8000", "client_version": APP_VERSION},
-        {"schema_version": 1, "server_url": "http://server-pc:8000", "client_version": "old"},
-        {"schema_version": 1, "server_url": "https://server-pc:8000", "client_version": APP_VERSION},
+        {"schema_version": 2, "server_url": "http://server-pc:8000", "client_version": "old", "enrollment_token": "enr_v1_" + ("x" * 44)},
+        {"schema_version": 2, "server_url": "https://server-pc:8000", "client_version": APP_VERSION, "enrollment_token": "enr_v1_" + ("x" * 44)},
     ],
 )
 def test_probe_client_rejects_invalid_or_mismatched_config(tmp_path, payload):

@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from flask import Blueprint, Response, jsonify, request, send_file, url_for
 
+from access_security import AccessSecurity, AccessSecurityError
 from .client_package import (
     ClientPackageError,
     build_client_package,
@@ -38,6 +39,7 @@ def create_probe_blueprint(
     web_port: int = 8000,
     lan_ip_resolver: Callable[[], str] = _default_lan_ip,
     client_bundle_path: str | Path | None = None,
+    access_security: AccessSecurity | None = None,
 ) -> Blueprint:
     blueprint = Blueprint("network_probe", __name__, url_prefix="/api/network-probe")
     package_lock = threading.Lock()
@@ -158,8 +160,17 @@ def create_probe_blueprint(
     def client_package():
         try:
             package_bundle, server_url = package_context()
+            enrollment_token = (
+                access_security.issue_enrollment_token()
+                if access_security is not None
+                else ""
+            )
             with package_lock:
-                package = build_client_package(package_bundle, server_url)
+                package = build_client_package(
+                    package_bundle,
+                    server_url,
+                    enrollment_token=enrollment_token,
+                )
         except ProbeServiceError as exc:
             return error_response(exc)
         except ClientPackageError as exc:
@@ -184,7 +195,16 @@ def create_probe_blueprint(
     @blueprint.post("/agents/register")
     def register_agent():
         try:
+            if access_security is not None:
+                access_security.require_agent_enrollment(client_ip())
             return jsonify(service.register_agent(payload(), client_ip()))
+        except AccessSecurityError:
+            return jsonify(
+                {
+                    "error": "클라이언트 등록 토큰이 없거나 만료 또는 이미 사용되었습니다. "
+                    "서버 화면에서 새 ZIP을 받으세요."
+                }
+            ), 401
         except ProbeServiceError as exc:
             return error_response(exc)
 

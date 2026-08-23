@@ -29,13 +29,14 @@ $ServerWork = Join-Path $BuildRoot "server-work"
 $ClientWork = Join-Path $BuildRoot "client-work"
 $ZipPath = Join-Path $DistRoot "$PackageName.zip"
 $ShaPath = "$ZipPath.sha256"
+$SbomPath = Join-Path $DistRoot "internal-upload_${Version}_sbom.cdx.json"
 $ReleaseNotesPath = Join-Path $DistRoot "release_notes_$Version.md"
 $ServerVersionInfo = Join-Path $BuildRoot "server-version.txt"
 $ClientVersionInfo = Join-Path $BuildRoot "client-version.txt"
 $TemplatesPath = Join-Path $Root "templates"
 $StaticPath = Join-Path $Root "static"
 
-foreach ($Path in @($PackageRoot, $PyInstallerDist, $ServerWork, $ClientWork, $ZipPath, $ShaPath, $ReleaseNotesPath)) {
+foreach ($Path in @($PackageRoot, $PyInstallerDist, $ServerWork, $ClientWork, $ZipPath, $ShaPath, $SbomPath, $ReleaseNotesPath)) {
     if (Test-Path $Path) { Remove-Item $Path -Recurse -Force }
 }
 New-Item -ItemType Directory -Force -Path $DistRoot, $BuildRoot, $PackageRoot, $PyInstallerDist, $ServerWork, $ClientWork | Out-Null
@@ -117,6 +118,7 @@ try {
     Copy-Item "README.md" (Join-Path $PackageRoot "README.md")
     Copy-Item "RELEASE_NOTES.md" (Join-Path $PackageRoot "RELEASE_NOTES.md")
     Copy-Item "CHANGELOG.md" (Join-Path $PackageRoot "CHANGELOG.md")
+    Copy-Item "LICENSE" (Join-Path $PackageRoot "LICENSE")
 
     New-Item -ItemType Directory -Force -Path `
         (Join-Path $PackageRoot "data"), `
@@ -182,6 +184,9 @@ TCP 전송 성능 측정:
 5. 서버 IP 또는 웹 포트가 바뀌면 클라이언트 ZIP을 다시 받습니다.
 
 보안 정보:
+- 루프백이 아닌 웹 접근은 토큰 로그인 또는 Bearer 인증이 필요합니다.
+- 브라우저의 상태 변경 요청은 CSRF 토큰을 검증하고 TCP 제어 프레임은 HMAC과 nonce로 재전송을 차단합니다.
+- 최초 실행 시 data/.internal-transfer-access-token이 생성되며 토큰 값은 로그나 명령행에 표시하지 않습니다.
 - 서버와 클라이언트는 기능이 분리된 별도 실행 파일입니다.
 - 서버 시작 과정에서 PowerShell을 실행하지 않습니다.
 - 실행파일, 스크립트, 매크로 문서와 디스크 이미지는 업로드할 수 없습니다.
@@ -191,12 +196,22 @@ TCP 전송 성능 측정:
 
     $PackagedServerExe = Join-Path $PackageRoot "InternalUploadServer.exe"
     $PackagedClientExe = Join-Path $ClientTemplate "NetworkProbeClient.exe"
-    & $PackagedServerExe --smoke-check
-    if ($LASTEXITCODE -ne 0) { throw "Server smoke check failed" }
-    & $PackagedServerExe --probe-self-check
-    if ($LASTEXITCODE -ne 0) { throw "Server probe self-check failed" }
-    & $PackagedClientExe --self-check
-    if ($LASTEXITCODE -ne 0) { throw "Client self-check failed" }
+    $SmokeTokenBytes = New-Object byte[] 48
+    $RandomNumberGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $RandomNumberGenerator.GetBytes($SmokeTokenBytes)
+    $RandomNumberGenerator.Dispose()
+    $env:INTERNAL_TRANSFER_ACCESS_TOKEN = "build-smoke-only-" + [Convert]::ToBase64String($SmokeTokenBytes)
+    try {
+        & $PackagedServerExe --smoke-check
+        if ($LASTEXITCODE -ne 0) { throw "Server smoke check failed" }
+        & $PackagedServerExe --probe-self-check
+        if ($LASTEXITCODE -ne 0) { throw "Server probe self-check failed" }
+        & $PackagedClientExe --self-check
+        if ($LASTEXITCODE -ne 0) { throw "Client self-check failed" }
+    }
+    finally {
+        Remove-Item Env:INTERNAL_TRANSFER_ACCESS_TOKEN -ErrorAction SilentlyContinue
+    }
 
     $RuntimeLock = Join-Path $PackageRoot "data/.internal-upload.instance.lock"
     if (Test-Path $RuntimeLock) { Remove-Item $RuntimeLock -Force }
@@ -209,6 +224,7 @@ TCP 전송 성능 측정:
         --source-commit $SourceCommit `
         --requirements-lock (Join-Path $Root "requirements-windows.lock")
     Assert-NativeSuccess "Security artifact generation" $LASTEXITCODE
+    Copy-Item (Join-Path $PackageRoot "sbom.cdx.json") $SbomPath
 
     Compress-Archive -Path (Join-Path $PackageRoot "*") -DestinationPath $ZipPath -Force
     python tools/verify_release_zip.py --zip $ZipPath --version $Version
@@ -221,33 +237,24 @@ TCP 전송 성능 측정:
     }
 
     @"
-# $Version - 사내 업로드 사용성 및 안정성 개선
+# $Version - 내부망 파일 전송 및 네트워크 진단 보안 강화
 
 ## 주요 변경
 
-- 업로드·삭제의 파일/CSV 경계와 HTTP/TCP 측정의 JSON/CSV 경계에 durable transaction과 재시작 복구 적용
-- 손상·충돌 transaction과 미정리 marker는 정상으로 추정하지 않고 새 작업 전에 fail-closed
-- 0바이트, 불일치 합계, 빈 결과와 변경된 응답 형식을 성공으로 저장하지 않도록 결과 검증 강화
-- 네트워크·요청 시간 상한, 동시 실행 제한, 중복 실행 방지와 취소·종료 자원 정리 강화
-- 결과 JSON 삭제 경합·손상·인코딩 오류를 경로와 traceback 없는 ``RESULT_READ_FAILED``로 반환
-- 설정·권한·저장 실패를 안정된 한국어 오류 코드와 다음 조치로 안내
-- 최근 완료·취소·실패, 부분 장애와 권장 조치를 민감정보 없이 보여주는 관리자 운영 요약 추가
-- 회전 진단 로그, 상태 API 실패 counter, 기본 config와 header-only 운영 CSV 릴리스 검사 추가
-- Windows 반복 시험에 working set·handle·thread·TCP socket 계측과 독립 누수 분석기 추가
-- 현재 소스 근거, 사용자별 평가와 P0/P1/P2 계획을 담은 한국어 진단 보고서 추가
-- Windows PowerShell 5.1 한국어와 CMD 실행을 각각 UTF-8 BOM/no-BOM으로 고정하고 local/Actions native 실패를 즉시 전파
-- Actions checkout 뒤 원격 tag ref를 다시 받아 annotated tag object와 source commit 일치를 검증
-- 이전 ``v0.5.2`` tag workflow는 fault worker 준비 파일 생성과 내용 쓰기 사이의 테스트 경합으로 중단됐고 Release asset은 생성되지 않음
-- TCP timeout 테스트는 ``persistence_complete``까지 기다리며, 저장 후 gate 해제와 완료 플래그 공개를 같은 임계구역에서 처리
-- fault worker 준비 마커는 비어 있지 않은 줄바꿈 완료 내용까지 기다리고 동일한 바이트 스냅샷을 사용
-- 기존 업로드·다운로드 URL, CSV·JSON·Excel 형식과 TCP 프로토콜 ``v2`` 유지
+- 루프백이 아닌 웹 요청에 토큰 로그인 또는 Bearer 인증을 의무화하고 브라우저 상태 변경 요청에 CSRF 검증 적용
+- TCP 제어 프레임을 프로토콜 ``v3`` HMAC-SHA256으로 인증하고 timestamp·nonce 재전송 방지 적용
+- Windows 클라이언트 등록을 짧은 수명의 일회용 enrollment token으로 제한
+- 접근 토큰은 환경 변수 또는 소유자 전용 파일에서만 읽고 토큰 값을 로그·URL·명령행에 노출하지 않음
+- PR·main push 검증의 모든 native 명령 실패를 즉시 전파해 뒤 명령이 실패 코드를 덮는 false-green 제거
+- Windows soak Python 출력을 UTF-8로 고정하고 Step Summary는 bounded Markdown만 게시하며 원시 JSON은 artifact로 보존
+- 기존 트랜잭션 복구, bounded server, 결과 검증과 CSV·JSON·Excel 호환성 유지
 
 ## 검증
 
-- 전체 회귀 458건과 장애 주입 32건 통과
-- Python compileall, JavaScript 5개 구문 검사와 의존성 무결성 검사 통과
-- Windows 2,708.89초 반복 시험 386 cycles 분석 결과 ``PASS_NO_REPEATED_PROCESS_GROWTH``
-- 서버 smoke·TCP 자체 점검, 클라이언트 자체 점검, 보안 산출물과 ZIP verifier 통과
+- GitHub-hosted Windows CI의 전체 회귀·장애 주입·native exit 전파 검증 통과
+- Python compileall, JavaScript 구문 검사와 hash-pinned 의존성 무결성 검사 통과
+- GitHub-hosted Windows 45분 합성 soak의 기능 결과와 분석 후처리 결과를 각각 검증하고 원시 JSON 보존
+- 서버 smoke·TCP 자체 점검, 클라이언트 자체 점검, SBOM·보안 산출물과 ZIP verifier 통과
 
 ## 실행
 
@@ -258,7 +265,8 @@ TCP 전송 성능 측정:
 ## 보안상 제한
 
 - 코드서명은 적용하지 않았으므로 보안 제품 경고가 완전히 사라지는 것을 보장하지 않습니다.
-- HTTP/TCP 토큰과 데이터는 평문이며 요청 Host 기반 주소 생성, 사내망 무인증 접근, 파일 크기 무제한, 압축파일 내부 미검사와 TCP 장기 폴링은 유지됩니다.
+- 내장 HTTP/TCP 전송은 암호화하지 않습니다. 신뢰할 수 있는 내부망·VPN 또는 TLS 역방향 프록시에서 사용하세요.
+- 파일 크기 제한과 압축파일 내부 검사는 적용하지 않습니다.
 - Windows 방화벽은 자동 조회하거나 변경하지 않습니다.
 
 SHA256: ``$Hash``

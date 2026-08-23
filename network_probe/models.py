@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-PROBE_PROTOCOL_VERSION = 2
+PROBE_PROTOCOL_VERSION = 3
 PROBE_DIRECTIONS = ("upload", "download", "full")
 PROBE_DURATIONS = (10, 30)
 PROBE_STREAM_COUNTS = (1, 4)
@@ -39,6 +39,7 @@ class ProbeConfig:
 class AgentRecord:
     agent_id: str
     token: str
+    tcp_hmac_key: str
     hostname: str
     client_ip: str
     server_host: str

@@ -18,7 +18,7 @@ from app_version import APP_VERSION
 from network_measurement import NetworkMeasurementGate
 from network_probe.models import PROBE_PROTOCOL_VERSION, ProbeConfig
 from network_probe.agent import ProbeClientError, connectivity_error_code, normalize_server_url
-from network_probe.protocol import recv_frame, send_frame
+from network_probe.protocol import ProbeProtocolError, recv_frame, send_frame, sign_frame
 from network_probe.self_check import run_probe_self_check
 from network_probe.service import ProbeService, ProbeServiceError
 from network_probe.tcp_engine import (
@@ -380,6 +380,97 @@ def test_probe_registration_requires_current_protocol_and_client_version(tmp_pat
         assert version_error.value.status_code == 409
     finally:
         service.stop()
+
+
+def test_non_loopback_tcp_control_requires_hmac_and_rejects_replay(tmp_path):
+    service, _ = build_service(tmp_path)
+    service.started = True
+    client_ip = "10.20.30.40"
+    registration = service.register_agent(
+        {
+            "agent_id": uuid.uuid4().hex,
+            "hostname": "REMOTE-PC",
+            "server_host": "10.20.30.10",
+            "protocol_version": PROBE_PROTOCOL_VERSION,
+            "client_version": APP_VERSION,
+        },
+        client_ip,
+    )
+    unsigned = {
+        "type": "connectivity_check",
+        "protocol_version": PROBE_PROTOCOL_VERSION,
+        "agent_id": registration["agent_id"],
+        "agent_token": registration["agent_token"],
+        "client_version": APP_VERSION,
+    }
+    with pytest.raises(ProbeServiceError, match="HMAC"):
+        service._handle_connectivity_check(client_ip, unsigned)
+    assert service.list_agents()[0]["connectivity_status"] == "checking"
+
+    signed = sign_frame(
+        {
+            "type": "connectivity_check",
+            "protocol_version": PROBE_PROTOCOL_VERSION,
+            "agent_id": registration["agent_id"],
+            "client_version": APP_VERSION,
+        },
+        registration["tcp_hmac_key"],
+    )
+    tampered = {**signed, "client_version": "v9.9.9"}
+    with pytest.raises(ProbeProtocolError, match="서명"):
+        service._handle_connectivity_check(client_ip, tampered)
+    assert service.list_agents()[0]["connectivity_status"] == "checking"
+
+    expired = sign_frame(
+        {
+            "type": "connectivity_check",
+            "protocol_version": PROBE_PROTOCOL_VERSION,
+            "agent_id": registration["agent_id"],
+            "client_version": APP_VERSION,
+        },
+        registration["tcp_hmac_key"],
+        timestamp=0,
+    )
+    with pytest.raises(ProbeProtocolError, match="시간"):
+        service._handle_connectivity_check(client_ip, expired)
+    assert service.list_agents()[0]["connectivity_status"] == "checking"
+
+    service._handle_connectivity_check(client_ip, signed)
+    assert service.list_agents()[0]["connectivity_status"] == "ready"
+    with pytest.raises(ProbeProtocolError, match="재사용"):
+        service._handle_connectivity_check(client_ip, signed)
+
+    created = service.create_session(
+        agent_id=registration["agent_id"],
+        direction="upload",
+        duration_seconds=10,
+        stream_count=1,
+    )
+    session = service.sessions[created["session_id"]]
+    unsigned_stream = {
+        "type": "data_stream",
+        "protocol_version": PROBE_PROTOCOL_VERSION,
+        "session_id": session.session_id,
+        "session_token": session.session_token,
+        "phase": "upload",
+        "stream_id": 0,
+    }
+    with pytest.raises(ProbeServiceError, match="HMAC"):
+        service._attach_stream(object(), client_ip, unsigned_stream)
+    assert session.sockets == {}
+
+    signed_stream = sign_frame(
+        {
+            "type": "data_stream",
+            "protocol_version": PROBE_PROTOCOL_VERSION,
+            "session_id": session.session_id,
+            "phase": "upload",
+            "stream_id": 0,
+        },
+        session.session_token,
+    )
+    service._attach_stream(object(), client_ip, signed_stream)
+    assert 0 in session.sockets["upload"]
 
 
 def test_probe_measurement_waits_for_successful_tcp_preflight(tmp_path):

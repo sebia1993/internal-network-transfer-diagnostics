@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from app_version import APP_VERSION
+from access_security import ENROLLMENT_TOKEN_PREFIX
 
 
 HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
@@ -149,6 +150,8 @@ def _client_readme(server_url: str, executable_sha256: str) -> bytes:
             "별도 주소 입력이나 config.ini 설정은 필요하지 않습니다.",
             "서버 PC의 IP 또는 웹 포트가 바뀌면 서버 웹 화면에서 ZIP을 다시 받으세요.",
             "TCP 측정 포트는 서버가 자동으로 전달하므로 포트만 바뀐 경우에는 다시 받을 필요가 없습니다.",
+            "이 ZIP의 등록 토큰은 짧은 시간 동안 한 번만 사용할 수 있습니다. 등록에 실패하거나 ZIP을 다른 PC에서 이미 실행했다면 새 ZIP을 받으세요.",
+            "등록이 끝나면 ZIP과 압축 해제한 client-config.json을 안전하게 삭제하세요.",
             "클라이언트 PC의 인바운드 방화벽 포트는 열 필요가 없습니다.",
             "이 클라이언트에는 파일 업로드 서버 기능이 포함되어 있지 않습니다.",
             "코드서명은 적용하지 않았습니다. EXE 해시와 client-manifest.json을 확인하세요.",
@@ -243,14 +246,34 @@ def verify_client_package(payload: bytes, server_url: str) -> list[str]:
             readme_name = f"{prefix}{CLIENT_README_NAME}"
             if config_name in names:
                 config = json.loads(archive.read(config_name).decode("utf-8"))
+                enrollment_token = (
+                    config.get("enrollment_token", "")
+                    if isinstance(config, dict)
+                    else ""
+                )
+                valid_enrollment = enrollment_token == "" or (
+                    isinstance(enrollment_token, str)
+                    and enrollment_token.startswith(ENROLLMENT_TOKEN_PREFIX)
+                    and len(enrollment_token) >= len(ENROLLMENT_TOKEN_PREFIX) + 32
+                )
                 if not isinstance(config, dict) or config != {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "server_url": server_url,
                     "client_version": APP_VERSION,
-                }:
+                    "enrollment_token": enrollment_token,
+                } or not valid_enrollment:
                     errors.append("클라이언트 자동 연결 설정이 올바르지 않습니다.")
-                if any(key in config for key in ("token", "agent_token", "session_token")):
-                    errors.append("클라이언트 자동 연결 설정에 인증 정보가 포함되어 있습니다.")
+                if any(
+                    key in config
+                    for key in (
+                        "token",
+                        "access_token",
+                        "agent_token",
+                        "session_token",
+                        "tcp_hmac_key",
+                    )
+                ):
+                    errors.append("클라이언트 자동 연결 설정에 장기 인증 정보가 포함되어 있습니다.")
             if manifest_name in names and executable_name in names:
                 manifest = json.loads(archive.read(manifest_name).decode("utf-8"))
                 actual_hash = hashlib.sha256(archive.read(executable_name)).hexdigest()
@@ -304,16 +327,22 @@ def verify_client_package(payload: bytes, server_url: str) -> list[str]:
     return errors
 
 
-def build_client_package(bundle_path: Path, server_url: str) -> ClientPackage:
+def build_client_package(
+    bundle_path: Path,
+    server_url: str,
+    *,
+    enrollment_token: str = "",
+) -> ClientPackage:
     host = _validated_server_host(server_url)
     files = _bundle_files(bundle_path)
     executable_sha256 = client_executable_sha256(bundle_path)
     root_name = f"InternalUpload_Client_{host}"
     config_payload = _json_bytes(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "server_url": server_url,
             "client_version": APP_VERSION,
+            "enrollment_token": enrollment_token,
         }
     )
     readme_payload = _client_readme(server_url, executable_sha256)

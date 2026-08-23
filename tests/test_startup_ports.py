@@ -17,6 +17,7 @@ from startup_ports import (
     PortResolution,
     StartupPortError,
     check_windows_firewall_port,
+    config_requires_legacy_probe_enable,
     config_requires_probe_enable_migration,
     find_available_port,
     migrate_config,
@@ -291,6 +292,22 @@ def test_current_config_respects_user_probe_disable(tmp_path):
     assert not result.probe_enabled_changed
     assert read_config(path).getboolean("network_probe", "ENABLED") is False
     assert path.read_bytes() == original
+
+
+def test_version_two_security_migration_preserves_user_probe_disable(tmp_path):
+    path = write_config(tmp_path, config_version=2, probe_enabled=False)
+
+    result = migrate_config(path)
+    parser = read_config(path)
+
+    assert result.previous_version == 2
+    assert result.current_version == CURRENT_CONFIG_VERSION
+    assert result.probe_enabled_changed is False
+    assert parser.getboolean("network_probe", "ENABLED") is False
+    assert parser.get("security", "ACCESS_TOKEN_FILE") == (
+        "data/.internal-transfer-access-token"
+    )
+    assert config_requires_legacy_probe_enable(path) is False
 
 
 def test_persist_probe_port_change_preserves_other_settings(tmp_path):
@@ -1042,7 +1059,7 @@ def test_main_does_not_persist_fallback_probe_port_when_bind_fails(tmp_path, mon
         ("PORT=8000", "PORT=0", "[app] PORT", "1~65535 사이의 정수"),
         ("RECENT_LIMIT=50", "RECENT_LIMIT=0", "[app] RECENT_LIMIT", "1~10000 사이의 정수"),
         ("RECENT_LIMIT=50", "RECENT_LIMIT=10001", "[app] RECENT_LIMIT", "1~10000 사이의 정수"),
-        ("CONFIG_VERSION=2", "CONFIG_VERSION=3", "[app] CONFIG_VERSION", "0~2 사이의 정수"),
+        ("CONFIG_VERSION=3", "CONFIG_VERSION=4", "[app] CONFIG_VERSION", "0~3 사이의 정수"),
         ("HOST=0.0.0.0", "HOST=http://host", "[app] HOST", "포트가 없는 호스트 이름"),
         ("BASE_URL=http://files.local:8000", "BASE_URL=file:///tmp", "[app] BASE_URL", "http(s) URL"),
         ("STORAGE_ROOT=uploads", "STORAGE_ROOT=   ", "[app] STORAGE_ROOT", "비어 있지 않은 폴더 경로"),

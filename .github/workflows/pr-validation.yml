@@ -3,7 +3,9 @@ name: PR Validation
 on:
   pull_request:
   push:
-    branches-ignore: [main]
+    branches:
+      - main
+      - "portfolio/**"
 
 permissions:
   contents: read
@@ -30,25 +32,48 @@ jobs:
 
       - name: Install hash-pinned dependencies
         shell: pwsh
-        run: python -m pip install --require-hashes -r requirements-windows.lock
+        run: |
+          python -m pip install --require-hashes -r requirements-windows.lock
+          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed with exit code $LASTEXITCODE" }
 
       - name: Run source regression checks
         shell: pwsh
         run: |
-          python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+          function Assert-NativeSuccess {
+            param([string]$Operation, [int]$ExitCode)
+            if ($ExitCode -ne 0) { throw "$Operation failed with exit code $ExitCode" }
+          }
+          python -m compileall access_security.py app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+          Assert-NativeSuccess "Python compileall" $LASTEXITCODE
+          node --check static/security.js
+          Assert-NativeSuccess "security.js syntax check" $LASTEXITCODE
           node --check static/network_check.js
+          Assert-NativeSuccess "network_check.js syntax check" $LASTEXITCODE
           node --check static/network_sustained.js
+          Assert-NativeSuccess "network_sustained.js syntax check" $LASTEXITCODE
           node --check static/network_probe.js
+          Assert-NativeSuccess "network_probe.js syntax check" $LASTEXITCODE
           node --check static/throughput_chart.js
+          Assert-NativeSuccess "throughput_chart.js syntax check" $LASTEXITCODE
           node --check static/operations_dashboard.js
+          Assert-NativeSuccess "operations_dashboard.js syntax check" $LASTEXITCODE
           python -m pytest -q
+          Assert-NativeSuccess "Python regression tests" $LASTEXITCODE
+          python tools/scan_tracked_secrets.py
+          Assert-NativeSuccess "Tracked secret scan" $LASTEXITCODE
           python tools/run_stability_fault_suite.py
+          Assert-NativeSuccess "Stability fault suite" $LASTEXITCODE
           python -m pip check
+          Assert-NativeSuccess "Python dependency check" $LASTEXITCODE
 
       - name: Build Windows release candidate
         shell: pwsh
-        run: .\tools\build_windows_release.ps1 -Version v0.5.3
+        run: |
+          .\tools\build_windows_release.ps1 -Version v0.6.0
+          if ($LASTEXITCODE -ne 0) { throw "Windows release build failed with exit code $LASTEXITCODE" }
 
       - name: Verify Windows release candidate
         shell: pwsh
-        run: python tools\verify_release_zip.py --zip dist\internal-upload_v0.5.3_windows.zip --version v0.5.3
+        run: |
+          python tools\verify_release_zip.py --zip dist\internal-upload_v0.6.0_windows.zip --version v0.6.0
+          if ($LASTEXITCODE -ne 0) { throw "Windows release verification failed with exit code $LASTEXITCODE" }
