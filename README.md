@@ -11,6 +11,22 @@
 
 > 이 도구는 신뢰된 내부망 사용을 전제로 합니다. 사용자 인증이 없는 인터넷 공개 서비스, 장비 인벤토리, 장애 티켓 시스템, 원격 실행 플랫폼을 목표로 하지 않습니다.
 
+## Portfolio Snapshot
+
+| 관점 | 구현 내용 |
+|---|---|
+| 운영 문제 | 장애 분석 파일을 내부망에서 옮기는 과정과 전송 지연 원인 확인을 하나의 운영 흐름으로 통합 |
+| 네트워크 분석 | 동일 경로를 HTTP와 별도 TCP probe로 측정해 애플리케이션 계층 영향과 전송 계층 품질을 분리 관측 |
+| 안정성 설계 | bounded worker, single-flight 측정, 디스크 예약, graceful shutdown, fail-closed 종료 적용 |
+| 데이터 무결성 | temp → fsync → transaction marker → atomic replace → startup recovery 흐름으로 중간 실패 복구 |
+| 보안 경계 | 저장 경로 제한, 위험 확장자 차단, 확장자 우회를 고려한 Windows PE `MZ` 헤더 검사 |
+| 검증 | Python/JavaScript 회귀 검증과 Windows upload/TCP/restart soak, 기본 45분 안정성 검증 수행 |
+| 배포 | Python 설치 없이 실행 가능한 Windows self-contained ZIP과 SHA-256/SBOM/security manifest 생성 |
+
+**기술 스택:** Python · Flask · TCP networking · JavaScript · pytest · Excel/JSON/CSV · GitHub Actions · Windows packaging
+
+이 프로젝트에서 보여주려는 핵심 역량은 단순 파일 서버 구현이 아니라 **네트워크 장애 분석 관점의 측정 설계, 장시간 운영 안정성, 실패 복구와 데이터 무결성, 운영 환경에 맞춘 안전 경계 설정**입니다.
+
 ## 한눈에 보기
 
 | 영역 | 기능 |
