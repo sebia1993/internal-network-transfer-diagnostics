@@ -152,7 +152,8 @@ ENROLLMENT_TOKEN_TTL_SECONDS=300
 | 회귀·장애 주입 | Windows CI와 로컬 개발 환경 | 라우트, 복구, 인증 실패, HMAC·replay, 파일/결과 무결성 | 실제 조직의 장비·보안 제품 호환성 |
 | Windows 패키지 | GitHub-hosted Windows runner | EXE self-check, ZIP 구조, SHA, SBOM, security manifest | 코드 서명된 publisher 신원 |
 | 45분 soak | GitHub-hosted Windows runner의 합성 파일/루프백 TCP | 업로드·TCP 자체 점검·재시작과 후처리, 자원 추세 | 현장 회선 속도, 장기 무중단 운영 전체 |
-| CodeQL·secret scan | GitHub Actions | 알려진 코드 패턴과 추적 파일의 대표 비밀 형식 | 모든 취약점·모든 비밀 형식 |
+| CodeQL default setup | GitHub Actions | Python·JavaScript의 알려진 코드 보안 패턴 | 모든 취약점·동적 운영 공격 |
+| tracked secret scan | GitHub Actions | Git 추적 파일의 대표 비밀 형식 | 모든 비밀 형식·Git 이력 전체 |
 
 Step Summary에는 크기가 제한된 Markdown만 게시하며, 원시 soak JSON과 분석 JSON은 workflow artifact로 보존합니다. 자동 검증의 판정 기준과 한계는 [검증 보고서](docs/VALIDATION_REPORT.md)에 있습니다.
 
