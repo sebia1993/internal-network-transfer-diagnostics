@@ -23,6 +23,7 @@ from measurement_transactions import (
 from network_measurement import NetworkMeasurementGate
 from result_storage import prune_old_json_results
 from runtime_stability import CsvIntegrityError, archive_csv_history
+from access_security import is_loopback_address
 
 from .models import (
     PROBE_CONNECTIVITY_INTERVAL_SECONDS,
@@ -35,7 +36,15 @@ from .models import (
     ProbeConfig,
     ProbeSession,
 )
-from .protocol import ProbeProtocolError, recv_frame, send_frame
+from .protocol import (
+    FRAME_AUTH_FIELD,
+    ProbeProtocolError,
+    ReplayGuard,
+    recv_frame,
+    send_frame,
+    sign_frame,
+    verify_frame_signature,
+)
 from .tcp_engine import (
     ProbeCancelled,
     ProbeTransferError,
@@ -247,6 +256,7 @@ class ProbeService:
         self.connection_handlers_lock = threading.Lock()
         self.connection_handlers: dict[threading.Thread, socket.socket] = {}
         self.stop_event = threading.Event()
+        self.replay_guard = ReplayGuard()
         self.start_error = ""
         self.started = False
         self.diagnostic_failure_count = 0
@@ -381,6 +391,7 @@ class ProbeService:
 
         now = self.clock()
         token = secrets.token_urlsafe(32)
+        tcp_hmac_key = secrets.token_urlsafe(32)
         with self.condition:
             self._cleanup_expired_agents_locked()
             previous = self.agents.get(agent_id)
@@ -394,6 +405,7 @@ class ProbeService:
             self.agents[agent_id] = AgentRecord(
                 agent_id=agent_id,
                 token=token,
+                tcp_hmac_key=tcp_hmac_key,
                 hostname=hostname,
                 client_ip=client_ip,
                 server_host=server_host,
@@ -406,6 +418,7 @@ class ProbeService:
         return {
             "agent_id": agent_id,
             "agent_token": token,
+            "tcp_hmac_key": tcp_hmac_key,
             "hostname": hostname,
             "client_ip": client_ip,
             "long_poll_seconds": self.config.long_poll_seconds,
@@ -803,17 +816,30 @@ class ProbeService:
                 agent = self._handle_connectivity_check(client_ip, payload)
                 send_frame(
                     connection,
-                    {
-                        "type": "connectivity_ready",
-                        "protocol_version": PROBE_PROTOCOL_VERSION,
-                        "server_version": APP_VERSION,
-                        "client_version": agent.client_version,
-                        "probe_port": self.config.port,
-                    },
+                    sign_frame(
+                        {
+                            "type": "connectivity_ready",
+                            "protocol_version": PROBE_PROTOCOL_VERSION,
+                            "server_version": APP_VERSION,
+                            "client_version": agent.client_version,
+                            "probe_port": self.config.port,
+                        },
+                        agent.tcp_hmac_key,
+                    ),
                 )
                 return
             session, phase, start_group = self._attach_stream(connection, client_ip, payload)
-            send_frame(connection, {"type": "ready", "session_id": session.session_id, "stream_id": payload["stream_id"]})
+            send_frame(
+                connection,
+                sign_frame(
+                    {
+                        "type": "ready",
+                        "session_id": session.session_id,
+                        "stream_id": payload["stream_id"],
+                    },
+                    session.session_token,
+                ),
+            )
             handed_off = True
             if start_group:
                 threading.Thread(
@@ -838,9 +864,21 @@ class ProbeService:
                 409,
             )
         agent_id = str(payload.get("agent_id", ""))
-        token = str(payload.get("agent_token", ""))
         client_version = self._clean_client_version(payload.get("client_version"))
-        agent = self.authenticate_agent(agent_id, token, client_ip)
+        with self.lock:
+            agent = self.agents.get(agent_id)
+            if agent is None or agent.client_ip != client_ip:
+                raise ProbeServiceError("에이전트 인증 정보가 올바르지 않습니다.", 401)
+            if FRAME_AUTH_FIELD in payload:
+                verify_frame_signature(payload, agent.tcp_hmac_key, self.replay_guard)
+                agent.last_seen_at = self.clock()
+            else:
+                if not is_loopback_address(client_ip):
+                    raise ProbeServiceError("TCP HMAC 인증이 필요합니다.", 401)
+                token = str(payload.get("agent_token", ""))
+                if not secrets.compare_digest(agent.token, token):
+                    raise ProbeServiceError("에이전트 인증 정보가 올바르지 않습니다.", 401)
+                agent.last_seen_at = self.clock()
         if agent.client_version != client_version:
             raise ProbeServiceError("등록된 클라이언트 버전과 TCP 점검 버전이 다릅니다.", 409)
         with self.condition:
@@ -862,15 +900,20 @@ class ProbeService:
         if int(payload.get("protocol_version", 0)) != PROBE_PROTOCOL_VERSION:
             raise ProbeServiceError("TCP 측정 프로토콜 버전이 다릅니다.", 409)
         session_id = str(payload.get("session_id", ""))
-        token = str(payload.get("session_token", ""))
         phase = str(payload.get("phase", ""))
         stream_id = int(payload.get("stream_id", -1))
         with self.lock:
             session = self._require_session_locked(session_id)
             if session.status in TERMINAL_STATUSES or session.cancel_event.is_set():
                 raise ProbeServiceError("종료된 TCP 측정 세션입니다.", 409)
-            if not secrets.compare_digest(session.session_token, token):
-                raise ProbeServiceError("TCP 측정 세션 토큰이 올바르지 않습니다.", 403)
+            if FRAME_AUTH_FIELD in payload:
+                verify_frame_signature(payload, session.session_token, self.replay_guard)
+            else:
+                if not is_loopback_address(client_ip):
+                    raise ProbeServiceError("TCP HMAC 인증이 필요합니다.", 401)
+                token = str(payload.get("session_token", ""))
+                if not secrets.compare_digest(session.session_token, token):
+                    raise ProbeServiceError("TCP 측정 세션 토큰이 올바르지 않습니다.", 403)
             if session.client_ip != client_ip:
                 raise ProbeServiceError("에이전트 등록 IP와 TCP 접속 IP가 다릅니다.", 403)
             if phase != session.next_phase():
@@ -899,13 +942,16 @@ class ProbeService:
             for stream_id, sock in sorted(sockets.items()):
                 send_frame(
                     sock,
-                    {
-                        "type": "go",
-                        "phase": phase,
-                        "stream_id": stream_id,
-                        "warmup_seconds": self.config.warmup_seconds,
-                        "duration_seconds": session.duration_seconds,
-                    },
+                    sign_frame(
+                        {
+                            "type": "go",
+                            "phase": phase,
+                            "stream_id": stream_id,
+                            "warmup_seconds": self.config.warmup_seconds,
+                            "duration_seconds": session.duration_seconds,
+                        },
+                        session.session_token,
+                    ),
                 )
             threading.Thread(
                 target=self._mark_measurement_running,

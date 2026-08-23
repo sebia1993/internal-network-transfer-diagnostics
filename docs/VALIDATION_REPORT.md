@@ -1,106 +1,59 @@
 # 검증 보고서
 
-이 문서는 Internal Network Transfer & Diagnostics의 자동 검증 범위와 해석 한계를 구분합니다.
+## 검증 원칙
 
-## 기본 회귀 검증
+성공한 마지막 명령만 보는 workflow는 앞선 실패를 숨길 수 있습니다. 모든 PowerShell native 명령 직후 `$LASTEXITCODE`를 확인하고 실패 시 즉시 `throw`합니다. 이 계약 자체도 회귀 테스트로 검사합니다.
 
-Release와 PR 검증은 다음 소스 계약을 확인합니다.
+## 자동 검증 구성
 
-```text
-Python compileall
-      ↓
-JavaScript syntax check
-      ↓
-pytest regression suite
-      ↓
-stability fault suite
-      ↓
-pip dependency check
-```
+| 게이트 | 환경 | 주요 증거 |
+|---|---|---|
+| PR Validation | GitHub-hosted Windows | compileall, JavaScript syntax, pytest, secret scan, fault suite, pip check, v0.6.0 ZIP build/verifier |
+| main push | GitHub-hosted Windows | PR Validation과 같은 source/package gate |
+| Security Scan | GitHub-hosted Linux | Python/JavaScript CodeQL, tracked secret scan |
+| Stability Soak | GitHub-hosted Windows | 합성 업로드, 루프백 TCP self-check, 서버 재시작, process 자원 표본, 분석 후처리 |
+| Release | annotated tag의 GitHub-hosted Windows | tag/commit 일치, clean build, server/client self-check, ZIP/SHA/SBOM 게시 |
 
-### Python 영역
+## P0 회귀 시나리오
 
-- 설정값 검증과 잘못된 설정의 fail-closed 처리
-- storage root 경로 제한
-- upload/download/delete 흐름
-- upload transaction recovery
-- measurement transaction recovery
-- JSON/CSV 결과 정합성
-- HTTP/TCP single-flight
-- TCP protocol/result handling
-- bounded server와 shutdown 상태
-- release/security artifact helper
+- pytest가 실패하면 뒤 fault suite·pip check가 실행돼도 workflow가 성공할 수 없음
+- Windows CP1252 환경과 무관하게 soak/analyzer JSON stdout을 UTF-8 bytes로 기록
+- Step Summary에는 최대 16KiB의 Markdown 핵심 결과만 기록
+- 원시 summary·analysis JSON과 Markdown은 artifact에 보존
+- 기능 soak 실패와 분석 후처리 실패를 서로 다른 단계로 표시
+- 비루프백 HTTP는 unauthenticated 요청 거부
+- cookie state-changing 요청은 CSRF 없으면 거부
+- TCP unsigned/tampered/expired/replayed frame은 상태 변경 전에 거부
+- enrollment token은 만료·재사용 시 거부
 
-### JavaScript 영역
+## soak 판정
 
-- HTTP network check
-- sustained measurement
-- TCP probe
-- throughput chart
-- operations summary
+soak는 합성 파일과 루프백 TCP로 서버 기동/종료, 업로드 transaction, TCP self-check, 재시작 후 저장 상태, working set·handle·thread·TCP socket 표본과 독립 분석 JSON 생성을 반복 확인합니다.
 
-각 핵심 JS 파일은 최소 syntax check를 통과해야 합니다.
+분석 결과는 `PASS_NO_REPEATED_PROCESS_GROWTH`, `REVIEW_RESOURCE_ANOMALY`, `INCONCLUSIVE_TELEMETRY`, `FUNCTIONAL_FAIL`로 구분합니다. PASS는 해당 runner·시간·합성 시나리오에서 반복 프로세스 증가 조건을 찾지 못했다는 뜻일 뿐, 장기 누수 부재나 현장 성능을 증명하지 않습니다.
 
-## Fault suite
+## Release 독립 검증
 
-`tools/run_stability_fault_suite.py`는 단순 정상 흐름과 별도로 저장·복구 오류 상황을 실행합니다. 목적은 중간 실패 후 모호한 상태를 정상 완료로 승격하지 않는지 확인하는 것입니다.
+`tools/verify_release_zip.py`는 ZIP 내부에서 다음을 다시 계산합니다.
 
-## Windows Stability Soak
+- 필수/금지 파일과 경로
+- server/client onedir 분리
+- config schema와 probe 기본 설정
+- header-only 운영 CSV
+- security manifest의 source commit, file size와 SHA-256
+- SBOM dependency와 lock hash
+- 내부 checksum
+- launcher UTF-8 no-BOM
 
-`.github/workflows/stability-windows.yml`은 실제 Windows runner에서 upload/TCP/restart 반복 동작을 수행합니다.
+게시 후에는 GitHub Release에서 ZIP·`.sha256`·독립 SBOM을 다시 내려받아 asset 이름, checksum과 ZIP verifier를 별도로 확인합니다.
 
-기본 scheduled soak:
+## 검증하지 않은 것
 
-```text
-baseline pytest
-    ↓
-45-minute upload / TCP / restart soak
-    ↓
-windows-soak-summary.json
-    ↓
-resource trend analyzer
-    ↓
-windows-soak-analysis.json
-```
+- 실제 조직 네트워크의 처리량, 지연, 손실 또는 SLA
+- 특정 방화벽, EDR, proxy, 브라우저와의 현장 호환성
+- 인터넷 공개 서비스 수준의 TLS termination·WAF·다중 사용자 권한
+- Windows EXE publisher 신원과 코드 서명 chain
+- 압축파일 내부 malware
+- 45분을 넘는 연속 운영 전체와 모든 자원 누수
 
-수동 실행 시 30/45/60분을 선택할 수 있습니다.
-
-분석 대상에는 반복 작업 성공 여부뿐 아니라 장시간 실행 중 자원 추세와 restart recovery 상태가 포함됩니다.
-
-## Windows Release 검증
-
-Release build는 `requirements-windows.lock`을 `--require-hashes`로 설치하고 source version과 요청 release version이 일치하는지 확인합니다.
-
-패키지 생성 후 `tools/verify_release_zip.py`는 다음 계약을 검사합니다.
-
-- 필수 server/client executable 존재
-- 예상하지 않은 executable·source/test/tool 파일 제외
-- ZIP path traversal·중복 Windows path·symlink/encrypted entry 거부
-- 운영 결과 JSON 미포함
-- CSV는 초기 header만 포함
-- default config 계약
-- launcher가 PowerShell/elevation을 우회적으로 호출하지 않음
-- server/client onedir runtime 분리
-- `security_manifest.json` 파일 목록·size·SHA-256 일치
-- CycloneDX SBOM 필수 dependency 확인
-- `SHA256SUMS.txt` 전체 패키지 파일 hash 일치
-
-## 검증이 증명하지 않는 것
-
-CI가 green이어도 다음을 보장하지 않습니다.
-
-- 특정 사내 스위치·AP·WAN 구간의 품질
-- 특정 endpoint의 EDR/방화벽/GPO 영향이 없다는 사실
-- 모든 브라우저 버전의 동일한 throughput
-- TCP/HTTP 차이의 단일 원인
-- 허용된 archive 내부 콘텐츠의 안전성
-- 인증이 없는 현재 서비스가 인터넷 노출에 안전하다는 의미
-- 모든 용량의 대형 파일을 모든 디스크 조건에서 수용할 수 있다는 의미
-
-## 결과 해석 원칙
-
-측정값은 절대적인 회선 인증 결과가 아니라 **해당 시점의 endpoint-to-endpoint 관측값**입니다. HTTP/TCP 결과, endpoint 자원, 네트워크 경로, 보안 제품 로그를 함께 봐야 합니다.
-
-## 실제 운영 데이터
-
-공개 검증 자료에는 실제 사내 IP, hostname, 업로드 파일, 메모, 운영 CSV/JSON 원문을 포함하지 않습니다. 실제 환경 검증 결과를 공개할 경우 수치와 조건만 비식별화해 기록해야 합니다.
+따라서 저장소의 수치와 자료는 합성 CI 검증으로만 표현하며 현장 성과로 인용하지 않습니다.

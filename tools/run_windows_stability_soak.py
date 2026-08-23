@@ -655,7 +655,7 @@ def write_soak_config(root: Path, web_port: int, probe_port: int) -> Path:
         "\n".join(
             [
                 "[app]",
-                "CONFIG_VERSION=2",
+                "CONFIG_VERSION=3",
                 "HOST=127.0.0.1",
                 f"PORT={web_port}",
                 f"BASE_URL=http://127.0.0.1:{web_port}",
@@ -966,7 +966,12 @@ def main(argv: list[str] | None = None) -> int:
         max_cycles=args.max_cycles,
     )
     payload = json.dumps(asdict(summary), ensure_ascii=False, indent=2)
-    print(payload)
+    binary_stdout = getattr(sys.stdout, "buffer", None)
+    if binary_stdout is not None:
+        binary_stdout.write((payload + "\n").encode("utf-8"))
+        binary_stdout.flush()
+    else:
+        sys.stdout.write(payload + "\n")
     if args.summary_path:
         Path(args.summary_path).write_text(payload + "\n", encoding="utf-8")
     return 0

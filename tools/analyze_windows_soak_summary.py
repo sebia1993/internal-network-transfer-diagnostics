@@ -1095,6 +1095,15 @@ def _write_output(path: Path, text: str) -> None:
     path.write_text(text + "\n", encoding="utf-8")
 
 
+def _write_stdout_utf8(text: str) -> None:
+    binary = getattr(sys.stdout, "buffer", None)
+    if binary is not None:
+        binary.write((text + "\n").encode("utf-8"))
+        binary.flush()
+        return
+    sys.stdout.write(text + "\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     summary_path = Path(args.summary_path)
@@ -1125,7 +1134,7 @@ def main(argv: list[str] | None = None) -> int:
         }[result["verdict"]]
 
     output_text = json.dumps(result, ensure_ascii=False, indent=2)
-    print(output_text)
+    _write_stdout_utf8(output_text)
     if args.output:
         output_path = Path(args.output)
         try:

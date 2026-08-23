@@ -8,13 +8,15 @@
 
 ```mermaid
 flowchart LR
-    B["Browser / Operator"] -->|"HTTP"| APP["Flask App"]
+    B["Browser / Operator"] -->|"login/Bearer + CSRF"| AUTH["Access Security"]
+    AUTH --> APP["Flask App"]
     APP --> BOUND["Bounded HTTP Server"]
     APP --> UPLOAD["Upload Service"]
     APP --> SUSTAINED["HTTP Measurement"]
     APP --> OPS["Operations Summary"]
 
-    CLIENT["Network Probe Client"] -->|"TCP"| PROBE["TCP Probe Service"]
+    CLIENT["Network Probe Client"] -->|"one-time enrollment"| AUTH
+    CLIENT -->|"HMAC TCP control"| PROBE["TCP Probe Service"]
 
     UPLOAD --> UTX["Upload Transactions"]
     SUSTAINED --> MTX["Measurement Transactions"]
@@ -30,6 +32,10 @@ flowchart LR
 ### `app.py`
 
 Flask route, 설정 로딩, 파일 업로드/다운로드/삭제, 네트워크 측정 API와 단일 페이지 UI 진입점을 담당합니다.
+
+### `access_security.py`
+
+비루프백 HTTP 인증, cookie session·CSRF, 접근 token 파일, 일회용 Windows client 등록 token을 담당합니다. token 값은 로그·URL·CLI에 전달하지 않습니다.
 
 ### `bounded_server.py`
 
@@ -49,7 +55,7 @@ HTTP/TCP 측정 간 공유되는 single-flight 실행 경계를 제공합니다.
 
 ### `network_probe/`
 
-HTTP 애플리케이션 계층과 분리된 TCP 측정 경로입니다. protocol, server, agent/client 상태, 통계, Windows telemetry, Excel 결과와 self-check를 포함합니다.
+HTTP 애플리케이션 계층과 분리된 TCP 측정 경로입니다. protocol `v3` HMAC, timestamp/nonce replay 방지, server, agent/client 상태, 통계, Windows telemetry, Excel 결과와 self-check를 포함합니다.
 
 ### `measurement_transactions.py`
 

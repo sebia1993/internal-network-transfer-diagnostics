@@ -1,102 +1,92 @@
-# 파일 전송·네트워크 진단 보안 모델
+# 보안 모델
 
-## 신뢰 경계
+## 범위와 신뢰 경계
 
-이 프로젝트는 **신뢰된 내부망**을 전제로 합니다. 인터넷 공개형 파일 공유 서비스나 다중 사용자 인증 플랫폼이 아닙니다.
+이 프로젝트는 인증된 운영자가 사용하는 내부망 보조 도구입니다. 인터넷 공개 서비스나 다중 사용자 권한 플랫폼은 목표가 아닙니다.
 
-```text
-허가된 내부 사용자
-        ↓ HTTP
-Internal Upload Server
-        ↓
-STORAGE_ROOT / measurement result
-```
+| 경계 | 적용 통제 | 남는 위험 |
+|---|---|---|
+| 브라우저 → 서버 HTTP | 비루프백 로그인 또는 master Bearer, cookie 요청 CSRF | 내장 HTTP는 평문이므로 도청 가능 |
+| Windows client → 등록 API | 30~3600초 범위의 1회용 enrollment Bearer | 최초 사용 전 탈취되면 선점 가능 |
+| TCP control | HMAC-SHA256, timestamp, 128-bit 이상 nonce, replay cache | payload 자체는 암호화되지 않음 |
+| 업로드 입력 → 파일 시스템 | storage root 고정, 경로 순회 차단, 위험 확장자·MZ 검사 | 허용된 압축파일 내부는 검사하지 않음 |
+| 실행 패키지 → 사용자 | hash-pinned lock, SHA-256, CycloneDX SBOM, manifest, CodeQL | EXE 코드 서명 없음 |
 
-사용자 인증 계층이 없는 현재 구조에서는 네트워크 접근 제어와 운영 환경 분리가 중요한 전제입니다.
+## HTTP 인증
 
-## 업로드 경로 제한
+- `127.0.0.0/8`과 `::1` 요청은 로컬 관리 편의를 위해 인증 없이 허용합니다.
+- 그 외 주소는 토큰 로그인 또는 `Authorization: Bearer ...`가 필요합니다.
+- 로그인 session은 `HttpOnly`, `SameSite=Strict` cookie를 사용합니다.
+- cookie 기반 POST/PUT/PATCH/DELETE는 `X-CSRF-Token` 또는 `_csrf_token`을 검증합니다.
+- master Bearer는 cookie를 사용하지 않으므로 CSRF 검증 대상이 아닙니다.
+- 세션은 설정된 TTL을 넘으면 실패 시 차단합니다.
 
-사용자가 지정하는 하위 경로는 설정된 `STORAGE_ROOT`를 벗어날 수 없습니다.
+역방향 프록시를 사용할 때 애플리케이션은 `X-Forwarded-For`를 신뢰하지 않습니다. 실제 peer가 프록시이면 그 peer 주소를 기준으로 판단합니다. 프록시 신뢰 설정과 원본 IP 정책은 운영자가 별도 경계에서 구성해야 합니다.
 
-차단 대상:
+## 비밀 생성·보관
 
-- 절대 경로
-- `..` 경로 순회
-- storage root 밖으로 해석되는 경로
+접근 토큰 검색 순서:
 
-파일 시스템 경계 검증 없이 사용자 입력 경로를 직접 사용하지 않습니다.
+1. `INTERNAL_TRANSFER_ACCESS_TOKEN` 환경 변수
+2. `[security] ACCESS_TOKEN_FILE`
+3. 파일이 없으면 cryptographic random token 생성
 
-## 위험 파일 차단
+토큰 값은 서버 시작 메시지, URL, CLI 인수, diagnostic log에 기록하지 않습니다. 파일 경로만 안내합니다. POSIX 기존 파일에 group/other 권한이 있거나 symlink이면 시작을 거부합니다. Windows에서는 서버 전용 계정과 NTFS ACL로 파일을 보호해야 합니다.
 
-운영 자료 전달 도구가 원격 실행 통로가 되지 않도록 다음 범주를 차단합니다.
+Git 추적 파일은 대표 private key, GitHub token, 앱 접근 토큰 패턴을 별도 스캔합니다. 이 스캔은 모든 비밀 형식을 보장하지 않습니다.
 
-- 실행파일
-- script / shortcut
-- driver
-- installer package
-- macro-enabled Office document
-- disk image
+## Windows client 등록
 
-Windows PE는 확장자만 신뢰하지 않고 `MZ` header도 검사하여 단순 확장자 변경 우회를 줄입니다.
+클라이언트 ZIP을 받을 때 서버는 짧은 수명의 enrollment token을 발급하고 digest와 만료 시각만 메모리에 보관합니다.
 
-이 기능은 malware scanner를 대체하지 않습니다. 허용된 ZIP 등 압축파일 내부 콘텐츠는 검사하지 않습니다.
+- 한 번 소비하면 같은 token은 다시 사용할 수 없습니다.
+- 만료되거나 이미 사용한 ZIP은 새로 받아야 합니다.
+- 등록 성공 후 agent Bearer와 TCP HMAC key는 프로세스 메모리에만 둡니다.
+- ZIP의 `client-config.json`은 등록 후 삭제하도록 안내합니다.
+- 서버 재시작으로 메모리 상태가 사라지면 새 ZIP을 발급해야 합니다.
 
-## 다운로드 경계
+## TCP HMAC과 재전송 방지
 
-다운로드는 브라우저가 콘텐츠를 직접 실행/해석할 가능성을 낮추기 위해 attachment와 `application/octet-stream`, `nosniff` 정책을 사용합니다.
+프로토콜 `v3` 제어 frame은 payload의 canonical JSON과 다음 필드를 HMAC-SHA256으로 서명합니다.
 
-## 삭제 권한
+- 알고리즘 식별자
+- Unix timestamp
+- cryptographic nonce
+- signature
 
-파일 삭제 요청은 `DELETE_ALLOWED_IPS`의 개별 IP 정책을 따릅니다. CIDR 기반 광범위 허용이 아니라 명시된 endpoint만 허용하는 현재 계약을 유지합니다.
+서버와 client는 signature를 먼저 검증한 뒤 timestamp 범위와 nonce 재사용을 확인합니다. unsigned, 잘못된 signature, 만료 timestamp, 중복 nonce는 상태 변경 전에 거부합니다. 루프백에서는 자체 점검 호환을 위해 legacy frame을 허용하지만, 비루프백에서는 HMAC이 필수입니다.
 
-## 디스크 고갈 방지
+시스템 시계가 허용 범위를 크게 벗어나면 정상 요청도 거부됩니다. 서버와 client의 시간 동기화를 유지하세요.
 
-고정 파일 크기 제한 대신 운영 디스크의 남은 용량을 보호합니다.
+## 파일·저장 경계
 
-- 최소 1GB reserve
-- 동시에 진행 중인 업로드의 예상 미기록 byte도 예약
-- 업로드 중 주기적 free-space 재검사
-- 공간 부족 시 temp 파일 정리
-- 합산 예약 후 부족하면 HTTP 507
+- 절대 경로, `..`, storage root 밖으로 해석되는 경로 차단
+- 실행파일·스크립트·설치 패키지·매크로 문서·디스크 이미지 차단
+- 확장자와 별개로 Windows PE `MZ` header 검사
+- 다운로드는 attachment, octet-stream, `nosniff`
+- 삭제는 인증 후에도 `DELETE_ALLOWED_IPS`를 추가 확인
+- 업로드/결과는 temp, flush/fsync, marker, atomic replace, startup recovery 순서
+- 모호한 transaction은 정상으로 승격하지 않고 새 작업을 차단
 
-## 동시성 경계
+## HTTP 보안 header
 
-- upload worker 최대 4
-- web request worker 최대 32
-- sustained/TCP 고부하 측정은 shared single-flight 경계
+응답에는 `no-store`, `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`와 same-origin CSP를 적용합니다. 내장 HTTP 때문에 `Secure` cookie는 기본으로 켤 수 없습니다. TLS proxy 환경에서는 프록시와 배포 정책에서 HTTPS 강제와 secure cookie 전략을 함께 검토해야 합니다.
 
-상한을 넘는 요청을 무제한 queue/thread로 받아들이지 않습니다.
+## 배포 무결성
 
-## 방화벽·권한
+Release ZIP에는 다음 자료를 포함합니다.
 
-프로그램은 Windows 방화벽을 자동 변경하거나 관리자 권한을 요청하지 않습니다. 필요한 포트 정책은 조직의 관리 절차에서 별도로 적용합니다.
+- `security_manifest.json`: source commit과 파일 size/SHA-256
+- `SHA256SUMS.txt`: 패키지 내부 파일 checksum
+- `sbom.cdx.json`: hash-pinned Windows dependency의 CycloneDX SBOM
+- `SECURITY_REVIEW_KO.md`: 예상 동작과 남는 위험
 
-## 데이터와 로그
+Release에는 ZIP, ZIP SHA-256, 독립 SBOM을 별도 asset으로 게시합니다. 이는 코드 서명을 대신하지 않습니다.
 
-실제 업로드 파일, 메모, 운영 CSV/JSON 결과, IP는 운영 데이터입니다. 공개 저장소에는 초기 CSV header와 문서용 fixture만 유지합니다.
+## 명시적 한계와 운영 조치
 
-오류 응답과 진단에서는 raw local path, traceback, 다른 사용자의 측정 결과를 불필요하게 노출하지 않는 것을 원칙으로 합니다.
-
-## Release 검증 자료
-
-Windows Release에는 다음 자료가 포함됩니다.
-
-- `SECURITY_REVIEW_KO.md`
-- `security_manifest.json`
-- `sbom.cdx.json`
-- `SHA256SUMS.txt`
-
-`security_manifest.json`은 패키지 파일의 크기·SHA-256과 source commit을 기록합니다. 현재 binary는 코드 서명되지 않았으므로 이 자료는 **출처·무결성 검토 수단**이지 서명된 publisher 신원을 의미하지 않습니다.
-
-## 잔여 위험
-
-현재 구조에서 의도적으로 남아 있는 제한입니다.
-
-- 애플리케이션 사용자 인증 없음
-- unsigned Windows binaries
-- 고정 upload size limit 없음
-- archive 내부 malware inspection 없음
-- trusted internal network 전제
-- TCP 측정 client의 장시간 polling/connection 가능
-
-따라서 외부 인터넷이나 불특정 사용자 네트워크에 직접 노출하지 않습니다.
+- 신뢰할 수 있는 내부망·VPN을 사용하고 신뢰 경계를 넘으면 TLS proxy를 적용합니다.
+- 토큰 파일, 다운로드한 client ZIP과 압축 해제 설정 파일의 접근 권한을 제한합니다.
+- 외부 노출이 의심되면 토큰 파일을 안전하게 교체하고 서버를 재시작하며 발급한 client ZIP을 폐기합니다.
+- 업로드 허용 파일도 조직의 malware scanning 정책을 적용합니다.
+- 실제 IP, hostname, 결과, 업로드 파일은 공개 Issue·PR·screenshot에 넣지 않습니다.

@@ -23,6 +23,7 @@ REQUIRED_FILES = {
     "README.md",
     "RELEASE_NOTES.md",
     "CHANGELOG.md",
+    "LICENSE",
     "SECURITY_REVIEW_KO.md",
     "security_manifest.json",
     "sbom.cdx.json",
@@ -83,6 +84,9 @@ def validate_archive_entries(entries: list[ZipInfo]) -> list[str]:
             errors.append(f"unsupported link or encrypted entry in ZIP: {raw_name}")
             continue
         if normalized.endswith("/"):
+            continue
+        if path.name == ".internal-transfer-access-token":
+            errors.append(f"runtime access token file must not be packaged: {raw_name}")
             continue
         if normalized in exact_names or normalized.casefold() in windows_names:
             errors.append(f"duplicate Windows path in ZIP: {raw_name}")
@@ -177,12 +181,24 @@ def validate_default_config(zip_file: ZipFile) -> list[str]:
     parser = ConfigParser()
     try:
         parser.read_string(zip_file.read("config.ini").decode("utf-8-sig"))
-        if parser.getint("app", "CONFIG_VERSION", fallback=0) < 2:
-            return ["config.ini must use CONFIG_VERSION=2 or newer"]
+        if parser.getint("app", "CONFIG_VERSION", fallback=0) < 3:
+            return ["config.ini must use CONFIG_VERSION=3 or newer"]
         if not parser.getboolean("network_probe", "ENABLED", fallback=False):
             return ["config.ini must enable TCP probe by default"]
         if not 1 <= parser.getint("network_probe", "PORT", fallback=0) <= 65535:
             return ["config.ini has an invalid TCP probe port"]
+        if parser.get("security", "ACCESS_TOKEN_FILE", fallback="") != (
+            "data/.internal-transfer-access-token"
+        ):
+            return ["config.ini has an invalid access token file setting"]
+        if not 5 <= parser.getint("security", "SESSION_TTL_MINUTES", fallback=0) <= 1440:
+            return ["config.ini has an invalid session TTL"]
+        if not 30 <= parser.getint(
+            "security",
+            "ENROLLMENT_TOKEN_TTL_SECONDS",
+            fallback=0,
+        ) <= 3600:
+            return ["config.ini has an invalid enrollment token TTL"]
     except (ConfigParserError, KeyError, ValueError):
         return ["config.ini has invalid default settings"]
     return []

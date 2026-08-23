@@ -14,6 +14,8 @@
 - measurement single-flight를 우회해 고부하 측정을 동시에 실행하지 않습니다.
 - transaction marker와 startup recovery를 무시하고 결과를 직접 정상 상태로 승격하지 않습니다.
 - release security artifact와 hash-pinned dependency 계약을 유지합니다.
+- 비루프백 HTTP 인증·CSRF와 TCP HMAC·replay 방지를 fail-closed로 유지합니다.
+- 접근·enrollment·agent·session token 값을 log, URL, CLI, fixture에 기록하지 않습니다.
 
 ## 주요 영역
 
@@ -31,13 +33,15 @@
 ## 기본 검증
 
 ```powershell
-python -m compileall app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+python -m compileall access_security.py app_version.py app.py bounded_server.py probe_client.py startup_ports.py runtime_stability.py upload_transactions.py measurement_transactions.py network_sustained.py sustained_excel.py excel_report.py network_measurement.py result_storage.py network_probe tests tools
+node --check static/security.js
 node --check static/network_check.js
 node --check static/network_sustained.js
 node --check static/network_probe.js
 node --check static/throughput_chart.js
 node --check static/operations_dashboard.js
 python -m pytest -q
+python tools/scan_tracked_secrets.py
 python tools/run_stability_fault_suite.py
 python -m pip check
 ```
@@ -54,8 +58,8 @@ python tools/analyze_windows_soak_summary.py windows-soak-summary.json --minimum
 현재 source version과 동일한 release version으로 clean worktree에서 빌드합니다.
 
 ```powershell
-.\tools\build_windows_release.ps1 -Version v0.5.3
-python tools\verify_release_zip.py --zip dist\internal-upload_v0.5.3_windows.zip --version v0.5.3
+.\tools\build_windows_release.ps1 -Version v0.6.0
+python tools\verify_release_zip.py --zip dist\internal-upload_v0.6.0_windows.zip --version v0.6.0
 ```
 
 Release build가 생성한 `security_manifest.json`, SBOM, SHA256 자료를 제거하거나 verifier를 우회하지 않습니다.

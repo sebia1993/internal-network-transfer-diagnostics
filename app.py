@@ -24,6 +24,11 @@ from urllib.parse import quote, urlparse
 
 from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request, send_file, stream_with_context, url_for
 
+from access_security import (
+    ACCESS_TOKEN_FILE_DEFAULT,
+    AccessSecurity,
+    AccessSecurityError,
+)
 from app_version import APP_VERSION
 from bounded_server import (
     WEB_FORCE_CLOSE_GRACE_SECONDS,
@@ -85,6 +90,7 @@ from startup_ports import (
     PortChangeDeclined,
     StartupPortError,
     check_windows_firewall_port,
+    config_requires_legacy_probe_enable,
     config_requires_probe_enable_migration,
     firewall_add_command,
     is_existing_instance,
@@ -123,6 +129,7 @@ APP_ROOT = get_runtime_root()
 RESOURCE_ROOT = get_resource_root()
 CONFIG_SECTION = "app"
 NETWORK_PROBE_SECTION = "network_probe"
+SECURITY_SECTION = "security"
 CSV_FIELDS = [
     "upload_id",
     "uploaded_at",
@@ -287,6 +294,9 @@ class AppConfig:
     network_probe_port: int
     network_probe_log_path: Path
     network_probe_results_root: Path
+    access_token_file: str
+    access_session_ttl_minutes: int
+    enrollment_token_ttl_seconds: int
 
 
 @dataclass
@@ -340,8 +350,10 @@ def load_config(config_path: str | os.PathLike[str] | None = None) -> AppConfig:
         parser.add_section(CONFIG_SECTION)
     if not parser.has_section(NETWORK_PROBE_SECTION):
         parser.add_section(NETWORK_PROBE_SECTION)
+    if not parser.has_section(SECURITY_SECTION):
+        parser.add_section(SECURITY_SECTION)
     app_defaults = {
-        "CONFIG_VERSION": "2",
+        "CONFIG_VERSION": "3",
         "HOST": "0.0.0.0",
         "PORT": "8000",
         "BASE_URL": "",
@@ -353,14 +365,23 @@ def load_config(config_path: str | os.PathLike[str] | None = None) -> AppConfig:
         "ENABLED": "true",
         "PORT": "5201",
     }
+    security_defaults = {
+        "ACCESS_TOKEN_FILE": ACCESS_TOKEN_FILE_DEFAULT,
+        "SESSION_TTL_MINUTES": "480",
+        "ENROLLMENT_TOKEN_TTL_SECONDS": "300",
+    }
     section = parser[CONFIG_SECTION]
     probe_section = parser[NETWORK_PROBE_SECTION]
+    security_section = parser[SECURITY_SECTION]
     for option, value in app_defaults.items():
         if option not in section:
             section[option] = value
     for option, value in probe_defaults.items():
         if option not in probe_section:
             probe_section[option] = value
+    for option, value in security_defaults.items():
+        if option not in security_section:
+            security_section[option] = value
     try:
         storage_root = Path(
             section.get("STORAGE_ROOT", "uploads")
@@ -398,6 +419,15 @@ def load_config(config_path: str | os.PathLike[str] | None = None) -> AppConfig:
         network_probe_port=probe_section.getint("PORT"),
         network_probe_log_path=app_root / "data" / "network_probe_log.csv",
         network_probe_results_root=app_root / "data" / "network_probe_results",
+        access_token_file=security_section.get(
+            "ACCESS_TOKEN_FILE",
+            ACCESS_TOKEN_FILE_DEFAULT,
+        ).strip()
+        or ACCESS_TOKEN_FILE_DEFAULT,
+        access_session_ttl_minutes=security_section.getint("SESSION_TTL_MINUTES"),
+        enrollment_token_ttl_seconds=security_section.getint(
+            "ENROLLMENT_TOKEN_TTL_SECONDS"
+        ),
     )
 
 
@@ -1447,6 +1477,13 @@ def create_app(
         static_folder=str(RESOURCE_ROOT / "static"),
     )
     config = app_config or load_config(config_path)
+    access_security = AccessSecurity(
+        app,
+        app_root=config.app_root,
+        token_file=config.access_token_file,
+        session_ttl_minutes=config.access_session_ttl_minutes,
+        enrollment_ttl_seconds=config.enrollment_token_ttl_seconds,
+    )
     active_logger = diagnostic_logger or configure_diagnostic_logger(config.log_path.parent)
     attach_diagnostic_handlers(app.logger, active_logger)
     try:
@@ -1507,6 +1544,7 @@ def create_app(
             web_port=config.port,
             lan_ip_resolver=detect_lan_ip,
             client_bundle_path=probe_client_bundle_path,
+            access_security=access_security,
         )
     )
     app.extensions["sustained_network_check"] = sustained_manager
@@ -2038,6 +2076,7 @@ def create_app(
                 storage_subdir=storage_subdir,
                 memo=memo,
                 deleted=request.args.get("deleted") == "1",
+                csrf_token=access_security.csrf_token(),
             ),
             status_code,
         )
@@ -2712,6 +2751,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         migration_required = config_requires_probe_enable_migration(resolved_config_path)
+        legacy_probe_enable_required = config_requires_legacy_probe_enable(
+            resolved_config_path
+        )
     except ConfigFileError as exc:
         print(f"사내 업로드 서버 시작 실패: {exc}", file=sys.stderr)
         return 2
@@ -2744,7 +2786,7 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigFileError as exc:
         print(f"사내 업로드 서버 시작 실패: {exc}", file=sys.stderr)
         return 2
-    if migration_required and migration_failed:
+    if migration_required and migration_failed and legacy_probe_enable_required:
         configured = replace(configured, network_probe_enabled=True)
     try:
         resolution = resolve_startup_port(
@@ -2837,6 +2879,9 @@ def main(argv: list[str] | None = None) -> int:
             measurement_gate=measurement_gate,
             diagnostic_logger=diagnostic_logger,
         )
+        token_path = flask_app.extensions["access_security"].token_path
+        if token_path is not None and active_config.host not in {"127.0.0.1", "localhost"}:
+            print(f"비루프백 웹 접근 인증이 활성화되었습니다. 접근 토큰 파일: {token_path}")
         try:
             web_server = make_server(
                 active_config.host,
@@ -2933,6 +2978,12 @@ def main(argv: list[str] | None = None) -> int:
             web_server.serve_forever()
         except KeyboardInterrupt:
             print("사내 업로드 서버를 종료합니다.")
+    except AccessSecurityError as exc:
+        diagnostic_logger.error(
+            "startup_access_security_failed error_type=AccessSecurityError"
+        )
+        print(f"사내 업로드 서버 시작 실패: {exc}", file=sys.stderr)
+        return 2
     except UploadTransactionError:
         diagnostic_logger.error(
             "startup_upload_transaction_recovery_failed "

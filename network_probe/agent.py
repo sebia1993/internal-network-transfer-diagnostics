@@ -4,7 +4,6 @@ import errno
 import json
 import socket
 import threading
-import time
 import uuid
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -14,7 +13,14 @@ from urllib.request import Request, urlopen
 from app_version import APP_VERSION
 
 from .models import PROBE_CONNECTIVITY_TIMEOUT_SECONDS, PROBE_PROTOCOL_VERSION
-from .protocol import ProbeProtocolError, recv_frame, send_frame
+from .protocol import (
+    ProbeProtocolError,
+    ReplayGuard,
+    recv_frame,
+    send_frame,
+    sign_frame,
+    verify_frame_signature,
+)
 from .tcp_engine import (
     ProbeCancelled,
     ProbeTransferError,
@@ -82,12 +88,16 @@ class ProbeHttpClient:
 
 
 class ProbeAgent:
-    def __init__(self, server_url: str) -> None:
+    def __init__(self, server_url: str, enrollment_token: str = "") -> None:
         self.base_url, self.server_host = normalize_server_url(server_url)
         self.http = ProbeHttpClient(self.base_url)
         self.agent_id = uuid.uuid4().hex
         self.hostname = socket.gethostname()[:64] or "Windows-PC"
         self.token = ""
+        self.enrollment_token = enrollment_token
+        self.tcp_hmac_key = ""
+        self.replay_guard = ReplayGuard()
+        self.registration: dict[str, Any] | None = None
         self.stop_event = threading.Event()
         self._last_connectivity_notice: tuple[str, str] | None = None
 
@@ -102,21 +112,28 @@ class ProbeAgent:
                 "protocol_version": PROBE_PROTOCOL_VERSION,
                 "client_version": APP_VERSION,
             },
+            token=self.enrollment_token,
         )
         self.token = str(response.get("agent_token", ""))
-        if not self.token:
-            raise ProbeClientError("서버가 에이전트 토큰을 반환하지 않았습니다.")
+        self.tcp_hmac_key = str(response.get("tcp_hmac_key", ""))
+        if not self.token or not self.tcp_hmac_key:
+            self.token = ""
+            self.tcp_hmac_key = ""
+            raise ProbeClientError("서버가 필요한 에이전트 인증 정보를 반환하지 않았습니다.")
+        self.enrollment_token = ""
+        self.registration = response
         return response
 
     def run_forever(self) -> int:
         retry_seconds = 1
         while not self.stop_event.is_set():
             try:
-                registration = self.register()
-                print(
-                    f"TCP 전송 성능 측정 클라이언트 {APP_VERSION} 등록됨: {self.hostname} "
-                    f"({registration.get('client_ip', '-')})"
-                )
+                registration = self.registration or self.register()
+                if retry_seconds == 1:
+                    print(
+                        f"TCP 전송 성능 측정 클라이언트 {APP_VERSION} 등록됨: {self.hostname} "
+                        f"({registration.get('client_ip', '-')})"
+                    )
                 self._check_connectivity(registration)
                 print("웹 화면에서 이 PC를 선택해 측정을 시작하세요. 종료: Ctrl+C")
                 retry_seconds = 1
@@ -137,6 +154,9 @@ class ProbeAgent:
                 if self.stop_event.is_set():
                     break
                 print(f"TCP 측정 서버 연결 오류: {exc}")
+                if "인증" in str(exc) or "토큰" in str(exc):
+                    print("서버 웹 화면에서 새 Windows 클라이언트 ZIP을 받아 다시 실행하세요.")
+                    return 2
                 print(f"{retry_seconds}초 후 다시 연결합니다.")
                 self.stop_event.wait(retry_seconds)
                 retry_seconds = min(retry_seconds * 2, 15)
@@ -154,17 +174,24 @@ class ProbeAgent:
                 sock.settimeout(PROBE_CONNECTIVITY_TIMEOUT_SECONDS)
                 send_frame(
                     sock,
-                    {
-                        "type": "connectivity_check",
-                        "protocol_version": PROBE_PROTOCOL_VERSION,
-                        "agent_id": self.agent_id,
-                        "agent_token": self.token,
-                        "client_version": APP_VERSION,
-                    },
+                    sign_frame(
+                        {
+                            "type": "connectivity_check",
+                            "protocol_version": PROBE_PROTOCOL_VERSION,
+                            "agent_id": self.agent_id,
+                            "client_version": APP_VERSION,
+                        },
+                        self.tcp_hmac_key,
+                    ),
                 )
                 response = recv_frame(sock)
             if response.get("type") == "error":
                 raise ProbeClientError(str(response.get("error", "TCP 연결 점검이 거부되었습니다.")))
+            response = verify_frame_signature(
+                response,
+                self.tcp_hmac_key,
+                self.replay_guard,
+            )
             if (
                 response.get("type") != "connectivity_ready"
                 or int(response.get("protocol_version", 0)) != PROBE_PROTOCOL_VERSION
@@ -265,23 +292,29 @@ class ProbeAgent:
                 sock.settimeout(10)
                 send_frame(
                     sock,
-                    {
-                        "type": "data_stream",
-                        "protocol_version": PROBE_PROTOCOL_VERSION,
-                        "session_id": session_id,
-                        "session_token": session_token,
-                        "phase": phase,
-                        "stream_id": stream_id,
-                    },
+                    sign_frame(
+                        {
+                            "type": "data_stream",
+                            "protocol_version": PROBE_PROTOCOL_VERSION,
+                            "session_id": session_id,
+                            "phase": phase,
+                            "stream_id": stream_id,
+                        },
+                        session_token,
+                    ),
                 )
                 ready = recv_frame(sock)
                 if ready.get("type") == "error":
                     raise ProbeClientError(str(ready.get("error", "TCP 스트림 연결이 거부되었습니다.")))
+                ready = verify_frame_signature(ready, session_token, self.replay_guard)
                 if ready.get("type") != "ready":
                     raise ProbeClientError("TCP 스트림 준비 응답이 올바르지 않습니다.")
                 sockets[stream_id] = sock
             for stream_id, sock in sockets.items():
                 go = recv_frame(sock)
+                if go.get("type") == "error":
+                    raise ProbeClientError(str(go.get("error", "TCP 측정 시작이 거부되었습니다.")))
+                go = verify_frame_signature(go, session_token, self.replay_guard)
                 if go.get("type") != "go" or int(go.get("stream_id", -1)) != stream_id:
                     raise ProbeClientError("TCP 측정 시작 응답이 올바르지 않습니다.")
 
@@ -369,8 +402,8 @@ class ProbeAgent:
                 return
 
 
-def run_probe_client(server_url: str) -> int:
-    return ProbeAgent(server_url).run_forever()
+def run_probe_client(server_url: str, enrollment_token: str = "") -> int:
+    return ProbeAgent(server_url, enrollment_token).run_forever()
 
 
 def connectivity_error_code(exc: BaseException) -> str:

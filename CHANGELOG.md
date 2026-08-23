@@ -2,9 +2,15 @@
 
 이 문서는 저장소에 반영된 주요 변경을 사람이 확인하기 위한 기록입니다. GitHub에 push하거나 Release를 준비하기 전에 `README.md`, `RELEASE_NOTES.md`, `CHANGELOG.md`를 함께 점검합니다.
 
-## Unreleased
+## v0.6.0 - 2026-08-24
 
-- 현재 예정된 변경사항이 없습니다.
+- 비루프백 HTTP 요청에 token login 또는 master Bearer 인증을 의무화하고 cookie 상태 변경 요청에 CSRF 검증을 추가했습니다.
+- TCP protocol을 `v3`으로 올려 HMAC-SHA256, timestamp와 nonce replay 방지를 적용하고 Windows client 등록을 짧은 수명의 1회용 token으로 제한했습니다.
+- 접근 token은 환경 변수 또는 소유자 전용 파일로만 구성하고 값은 URL·CLI·로그·Git 추적 파일에 남기지 않습니다.
+- PR/main Windows validation의 모든 native exit를 즉시 검사해 뒤 명령이 앞선 실패를 덮는 false-green을 제거했습니다.
+- Windows soak/analyzer 출력을 UTF-8로 고정하고 Step Summary는 bounded Markdown, 원시 JSON은 artifact로 분리했습니다.
+- MIT License, CodeQL, tracked secret scan, 독립 SBOM Release asset과 현재 보안·검증·UI 안내 문서를 추가했습니다.
+- 기존 업로드 transaction, bounded server, CSV·JSON·Excel 저장 형식은 유지합니다. TCP `v2` client는 호환되지 않으므로 새 ZIP이 필요합니다.
 
 ## v0.5.3 - 2026-08-05
 

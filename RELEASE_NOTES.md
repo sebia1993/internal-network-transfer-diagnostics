@@ -1,8 +1,23 @@
 # Release Notes 운영 규칙
 
-현재 앱 버전: `v0.5.3`
+현재 앱 버전: `v0.6.0`
 
 이 파일은 저장소에 커밋하는 릴리즈 준비 점검 문서입니다. 현재 GitHub Actions가 Windows 실행 ZIP을 만들고 GitHub Release에 업로드합니다. Release 본문은 이 파일과 `CHANGELOG.md` 기준으로 작성합니다.
+
+## v0.6.0 - 2026-08-24
+
+비루프백 웹 인증·CSRF, TCP HMAC·replay 방지와 1회용 client 등록을 추가한 보안 강화 릴리스입니다. PR/main workflow의 native exit를 각 명령 직후 검사하고, Windows soak의 기능 결과와 분석 후처리 결과를 분리해 검증합니다.
+
+게시 전 게이트:
+
+- Windows CI 전체 회귀, 장애 주입, tracked secret scan, CodeQL과 hash-pinned dependency 검사
+- 비루프백 unauthenticated/CSRF 실패, unsigned·변조·만료·replay TCP frame의 fail-closed 테스트
+- clean Windows onedir 빌드, server/client self-check, ZIP verifier
+- GitHub-hosted Windows 45분 합성 soak의 기능·후처리 성공과 원시 JSON artifact 확인
+- annotated `v0.6.0` tag와 merge commit 일치 확인
+- Release ZIP, SHA256, 독립 CycloneDX SBOM 다운로드 후 checksum·구조 독립 검증
+
+검증 수치는 실제 현장 성과가 아니라 합성 CI 범위로만 표현합니다. 내장 HTTP/TCP는 암호화하지 않으므로 신뢰 내부망·VPN 또는 TLS 역방향 프록시가 필요합니다. Windows binary는 코드 서명되지 않았고 업로드 크기 고정 상한과 압축 내부 검사는 제공하지 않습니다.
 
 ## v0.5.3 - 2026-08-05
 

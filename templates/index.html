@@ -3,8 +3,10 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token }}">
     <title>사내 파일 전송 및 네트워크 체크</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script defer src="{{ url_for('static', filename='security.js') }}"></script>
     <script defer src="{{ url_for('static', filename='network_check.js') }}"></script>
     <script defer src="{{ url_for('static', filename='throughput_chart.js') }}"></script>
     <script defer src="{{ url_for('static', filename='network_sustained.js') }}"></script>
@@ -24,6 +26,10 @@
           <span class="badge">삭제 제한</span>
         {% endif %}
         <span class="badge">포트 {{ config.port }}</span>
+        <form action="{{ url_for('access_logout') }}" method="post" class="logout-form">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary">로그아웃</button>
+        </form>
       </div>
     </header>
 
@@ -208,6 +214,7 @@
             aria-describedby="upload-form-help upload-submit-status"
             aria-busy="false"
             data-upload-form>
+            <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
             <label>
               <span>파일</span>
               <input type="file" name="file" required>
@@ -280,7 +287,7 @@
 
             <label class="link-box">
               <span>다운로드 링크</span>
-              <input type="text" readonly value="{{ result.download_url }}" onclick="this.select()">
+              <input type="text" readonly value="{{ result.download_url }}" data-select-on-click>
             </label>
 
             <div class="actions">
@@ -338,7 +345,8 @@
                         <form
                           action="{{ url_for('delete', upload_id=record.upload_id) }}"
                           method="post"
-                          onsubmit="return confirm('파일과 CSV 기록을 삭제할까요?');">
+                          data-confirm-delete>
+                          <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
                           <button
                             type="submit"
                             class="danger"
