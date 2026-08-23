@@ -10,7 +10,8 @@
 |---|---|---|
 | PR Validation | GitHub-hosted Windows | compileall, JavaScript syntax, pytest, secret scan, fault suite, pip check, v0.6.0 ZIP build/verifier |
 | main push | GitHub-hosted Windows | PR Validation과 같은 source/package gate |
-| Security Scan | GitHub-hosted Linux | Python/JavaScript CodeQL, tracked secret scan |
+| CodeQL default setup | GitHub-hosted Linux | Python/JavaScript security query |
+| Security Scan | GitHub-hosted Linux | tracked secret scan |
 | Stability Soak | GitHub-hosted Windows | 합성 업로드, 루프백 TCP self-check, 서버 재시작, process 자원 표본, 분석 후처리 |
 | Release | annotated tag의 GitHub-hosted Windows | tag/commit 일치, clean build, server/client self-check, ZIP/SHA/SBOM 게시 |
 
