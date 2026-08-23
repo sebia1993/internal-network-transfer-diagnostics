@@ -11,7 +11,6 @@ from access_security import (
     ACCESS_TOKEN_ENV,
     AccessSecurityError,
     EnrollmentTokenStore,
-    _safe_next_url,
     load_or_create_access_token,
 )
 from app import create_app, main as app_main
@@ -51,20 +50,6 @@ def remote() -> dict[str, str]:
     return {"REMOTE_ADDR": "10.20.30.40"}
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        "https://attacker.example/",
-        "//attacker.example",
-        "/\\attacker.example",
-        "/%5cattacker.example",
-        "/%2f%2fattacker.example",
-    ],
-)
-def test_login_next_rejects_external_or_ambiguous_paths(value):
-    assert _safe_next_url(value) == "/"
-
-
 def test_non_loopback_requires_login_or_master_bearer_and_csrf(tmp_path):
     app = create_app(write_config(tmp_path))
     app.config.update(TESTING=True)
@@ -86,16 +71,16 @@ def test_non_loopback_requires_login_or_master_bearer_and_csrf(tmp_path):
     )
 
     assert redirect_response.status_code == 302
-    assert redirect_response.location == "/login?next=/"
+    assert redirect_response.location == "/login"
     assert api_response.status_code == 401
     assert bearer_response.status_code == 200
     assert bearer_write_response.status_code == 503
 
-    login_page = client.get("/login?next=/", environ_base=remote())
+    login_page = client.get("/login", environ_base=remote())
     csrf = re.search(r'name="_csrf_token" value="([^"]+)"', login_page.get_data(as_text=True))
     assert csrf is not None
     logged_in = client.post(
-        "/login?next=/",
+        "/login",
         data={"access_token": token, "_csrf_token": csrf.group(1)},
         environ_base=remote(),
     )

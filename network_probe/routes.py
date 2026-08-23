@@ -198,8 +198,13 @@ def create_probe_blueprint(
             if access_security is not None:
                 access_security.require_agent_enrollment(client_ip())
             return jsonify(service.register_agent(payload(), client_ip()))
-        except AccessSecurityError as exc:
-            return jsonify({"error": str(exc)}), 401
+        except AccessSecurityError:
+            return jsonify(
+                {
+                    "error": "클라이언트 등록 토큰이 없거나 만료 또는 이미 사용되었습니다. "
+                    "서버 화면에서 새 ZIP을 받으세요."
+                }
+            ), 401
         except ProbeServiceError as exc:
             return error_response(exc)
 

@@ -56,9 +56,7 @@ def main() -> int:
     root = Path(__file__).resolve().parents[1]
     findings = scan_paths(tracked_paths(root))
     if findings:
-        for path, line, rule in findings:
-            location = f"{path}:{line}" if line else path
-            print(f"secret scan finding: {location} rule={rule}")
+        print(f"Tracked secret scan failed with {len(findings)} finding(s).")
         return 1
     print("Tracked secret scan passed")
     return 0

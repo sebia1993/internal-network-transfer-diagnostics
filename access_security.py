@@ -9,7 +9,6 @@ import stat
 import threading
 import time
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
 
 from flask import (
     Flask,
@@ -30,7 +29,6 @@ ACCESS_TOKEN_MIN_LENGTH = 32
 ENROLLMENT_TOKEN_PREFIX = "enr_v1_"
 SESSION_AUTH_KEY = "access_authenticated_at"
 SESSION_CSRF_KEY = "csrf_token"
-SESSION_NEXT_KEY = "login_next"
 UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
@@ -179,23 +177,6 @@ class EnrollmentTokenStore:
         return expiry is not None and expiry > now
 
 
-def _safe_next_url(value: str) -> str:
-    parsed = urlsplit(value)
-    decoded = value
-    for _ in range(2):
-        decoded = unquote(decoded)
-    if (
-        parsed.scheme
-        or parsed.netloc
-        or not value.startswith("/")
-        or decoded.startswith("//")
-        or "\\" in decoded
-        or any(ord(character) < 32 for character in decoded)
-    ):
-        return "/"
-    return value
-
-
 class AccessSecurity:
     _AGENT_API_SUFFIXES = (
         "/connectivity-failure",
@@ -281,8 +262,7 @@ class AccessSecurity:
     def _unauthorized() -> Response | tuple[Response, int]:
         if request.path.startswith("/api/"):
             return jsonify({"error": "인증이 필요합니다."}), 401
-        next_url = _safe_next_url(request.full_path.rstrip("?"))
-        return redirect(url_for("access_login", next=next_url), code=302)
+        return redirect(url_for("access_login"), code=302)
 
     def require_agent_enrollment(self, client_ip: str) -> None:
         if is_loopback_address(client_ip):
@@ -337,20 +317,16 @@ class AccessSecurity:
         def access_login():
             if is_loopback_address(request.remote_addr):
                 return redirect("/")
-            next_url = _safe_next_url(request.args.get("next") or session.get(SESSION_NEXT_KEY, "/"))
             if request.method == "GET":
-                session[SESSION_NEXT_KEY] = next_url
                 return render_template(
                     "login.html",
                     csrf_token=self.csrf_token(),
-                    next_url=next_url,
                     error="",
                 )
             if not self._csrf_valid():
                 return render_template(
                     "login.html",
                     csrf_token=self.csrf_token(),
-                    next_url=next_url,
                     error="로그인 요청 검증에 실패했습니다. 페이지를 새로 열어 다시 시도하세요.",
                 ), 403
             candidate = request.form.get("access_token", "")
@@ -359,13 +335,12 @@ class AccessSecurity:
                 return render_template(
                     "login.html",
                     csrf_token=self.csrf_token(),
-                    next_url=next_url,
                     error="접근 토큰이 올바르지 않습니다.",
                 ), 401
             session.clear()
             session[SESSION_AUTH_KEY] = time.time()
             session[SESSION_CSRF_KEY] = secrets.token_urlsafe(32)
-            return redirect(next_url)
+            return redirect("/")
 
         @app.post("/logout")
         def access_logout():
