@@ -2344,8 +2344,8 @@ def create_app(
     def network_check_download():
         try:
             size_mb = parse_network_check_size(request.args.get("size_mb"))
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
+        except ValueError:
+            return jsonify({"error": "측정 데이터량이 올바르지 않습니다."}), 400
 
         owner_id = uuid.uuid4().hex
         if not active_gate.acquire("http_quick", owner_id):
@@ -2411,8 +2411,8 @@ def create_app(
     def network_check_upload():
         try:
             size_mb = parse_network_check_size(request.args.get("size_mb"))
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
+        except ValueError:
+            return jsonify({"error": "측정 데이터량이 올바르지 않습니다."}), 400
 
         owner_id = uuid.uuid4().hex
         if not active_gate.acquire("http_quick", owner_id):
@@ -2501,8 +2501,8 @@ def create_app(
         cleanup_expired_upload_sessions()
         try:
             size_mb = parse_network_check_size(request.args.get("size_mb"))
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
+        except ValueError:
+            return jsonify({"error": "측정 데이터량이 올바르지 않습니다."}), 400
 
         session_id = uuid.uuid4().hex
         if not active_gate.acquire(

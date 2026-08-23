@@ -73,7 +73,18 @@ def create_probe_blueprint(
         return header[7:].strip()
 
     def error_response(exc: ProbeServiceError):
-        return jsonify({"error": str(exc)}), exc.status_code
+        messages = {
+            400: "TCP 측정 요청이 올바르지 않습니다.",
+            401: "TCP 측정 인증이 필요하거나 올바르지 않습니다.",
+            403: "TCP 측정 요청 권한이 없습니다.",
+            404: "TCP 측정 결과나 클라이언트를 찾을 수 없습니다.",
+            409: "TCP 측정 요청이 현재 상태와 충돌했습니다. Windows 방화벽과 클라이언트 상태를 확인하세요.",
+            413: "TCP 측정 요청 본문은 64 KiB를 초과할 수 없습니다.",
+            429: "등록 가능한 TCP 측정 클라이언트 수를 초과했습니다.",
+            500: "RESULT_READ_FAILED: TCP 측정 결과를 안전하게 읽거나 생성할 수 없습니다.",
+            503: "TCP 측정 기능을 사용할 수 없습니다. 설정과 Windows 클라이언트 프로그램 폴더를 확인하세요.",
+        }
+        return jsonify({"error": messages.get(exc.status_code, "TCP 측정 요청을 처리할 수 없습니다.")}), exc.status_code
 
     def payload() -> dict[str, Any]:
         content_length = request.content_length
@@ -130,7 +141,10 @@ def create_probe_blueprint(
                 scheme=request.scheme,
             )
         except ClientPackageError as exc:
-            raise ProbeServiceError(str(exc), 400) from exc
+            raise ProbeServiceError(
+                "클라이언트 패키지 접속 주소를 확인할 수 없습니다.",
+                400,
+            ) from exc
         return bundle_path, server_url
 
     @blueprint.get("/status")
@@ -150,10 +164,12 @@ def create_probe_blueprint(
             value["client_package_available"] = True
             value["client_package_server_url"] = server_url
             value["client_executable_sha256"] = package_client_hash(package_bundle)
-        except ClientPackageError as exc:
-            value["client_package_error"] = str(exc)
-        except ProbeServiceError as exc:
-            value["client_package_error"] = str(exc)
+        except ClientPackageError:
+            value["client_package_error"] = "Windows 클라이언트 패키지를 준비할 수 없습니다."
+        except ProbeServiceError:
+            value["client_package_error"] = (
+                "Windows Release 폴더의 클라이언트 패키지를 준비할 수 없습니다."
+            )
         return jsonify(value)
 
     @blueprint.get("/client-package.zip")
@@ -173,8 +189,8 @@ def create_probe_blueprint(
                 )
         except ProbeServiceError as exc:
             return error_response(exc)
-        except ClientPackageError as exc:
-            return jsonify({"error": str(exc)}), 500
+        except ClientPackageError:
+            return jsonify({"error": "Windows 클라이언트 패키지 생성에 실패했습니다."}), 500
         response = send_file(
             io.BytesIO(package.payload),
             mimetype="application/zip",
@@ -298,8 +314,8 @@ def create_probe_blueprint(
             filename = build_probe_excel_filename(saved)
         except ProbeServiceError as exc:
             return error_response(exc)
-        except ProbeExcelError as exc:
-            return jsonify({"error": str(exc)}), 500
+        except ProbeExcelError:
+            return jsonify({"error": "TCP 측정 Excel 결과 생성에 실패했습니다."}), 500
         response = send_file(
             io.BytesIO(workbook),
             mimetype=EXCEL_MIME_TYPE,

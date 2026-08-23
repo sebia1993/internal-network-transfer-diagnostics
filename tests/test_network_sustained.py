@@ -281,28 +281,21 @@ def test_manager_excludes_warmup_and_persists_result(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("results", "expected_error"),
+    "results",
     [
-        ({}, "브라우저 측 전송 결과가 없습니다"),
-        (
-            {"upload": client_result(0)},
-            "브라우저 측 전송량이 없어",
-        ),
-        (
-            {
-                "upload": {
-                    **client_result(3_000_000),
-                    "actual_duration_seconds": 0,
-                }
-            },
-            "브라우저 측 측정 시간이 올바르지 않습니다",
-        ),
+        {},
+        {"upload": client_result(0)},
+        {
+            "upload": {
+                **client_result(3_000_000),
+                "actual_duration_seconds": 0,
+            }
+        },
     ],
 )
 def test_success_requires_present_positive_client_result(
     tmp_path,
     results,
-    expected_error,
 ):
     clock = FakeClock()
     gate = NetworkMeasurementGate()
@@ -327,7 +320,7 @@ def test_success_requires_present_positive_client_result(
     )
 
     assert result["status"] == "failure"
-    assert expected_error in result["error"]
+    assert "측정 결과 검증에 실패" in result["error"]
     assert result["directions"]["upload"]["bytes_transferred"] == 3_000_000
     assert manager.active_session is None
     assert gate.is_available() is True
@@ -337,7 +330,7 @@ def test_success_requires_present_positive_client_result(
         )
     )
     assert saved["status"] == "failure"
-    assert expected_error in saved["error"]
+    assert "측정 결과 검증에 실패" in saved["error"]
 
 
 def test_success_rejects_interval_sum_mismatch_and_preserves_failure(tmp_path):
@@ -364,7 +357,7 @@ def test_success_rejects_interval_sum_mismatch_and_preserves_failure(tmp_path):
     )
 
     assert result["status"] == "failure"
-    assert "전체 전송량과 구간 전송량 합계" in result["error"]
+    assert "측정 결과 검증에 실패" in result["error"]
     assert result["directions"]["download"]["bytes_transferred"] == 3_000_000
 
 
@@ -385,8 +378,41 @@ def test_success_rejects_client_and_server_byte_mismatch(tmp_path):
     )
 
     assert result["status"] == "failure"
-    assert "브라우저 측 전송량과 서버 측 전송량 차이" in result["error"]
+    assert "측정 결과 검증에 실패" in result["error"]
     assert result["directions"]["download"]["bytes_transferred"] == 3_000_000
+
+
+def test_complete_does_not_persist_caught_validation_exception_message(
+    tmp_path,
+    monkeypatch,
+):
+    clock = FakeClock()
+    manager = create_manager(tmp_path, clock)
+    session = complete_measured_session(
+        manager,
+        clock,
+        direction="upload",
+        byte_count=3_000_000,
+    )
+    sensitive_message = "customer-secret-path-and-payload"
+
+    def fail_validation(*_args, **_kwargs):
+        raise SustainedCheckError(sensitive_message)
+
+    monkeypatch.setattr(manager, "_validate_success_client_results", fail_validation)
+    result = manager.complete(
+        session.session_id,
+        session.client_ip,
+        {"results": {"upload": client_result(3_000_000)}},
+    )
+    saved_text = (
+        manager.results_root / f"{session.session_id}.json"
+    ).read_text(encoding="utf-8")
+
+    assert result["status"] == "failure"
+    assert "측정 결과 검증에 실패" in result["error"]
+    assert sensitive_message not in json.dumps(result, ensure_ascii=False)
+    assert sensitive_message not in saved_text
 
 
 def test_success_allows_small_last_chunk_accounting_difference(tmp_path):

@@ -13,6 +13,7 @@ from network_probe.excel import (
     build_probe_excel_filename,
 )
 from network_probe.routes import create_probe_blueprint
+from network_probe.service import ProbeServiceError
 from tests.test_network_probe import build_service
 
 
@@ -282,5 +283,30 @@ def test_probe_json_download_returns_safe_error_for_invalid_utf8(tmp_path):
     assert "RESULT_READ_FAILED" in response.json["error"]
     assert "UnicodeDecodeError" not in response.json["error"]
     assert str(result_path) not in response.json["error"]
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_probe_error_response_does_not_expose_caught_exception_message(
+    tmp_path,
+    monkeypatch,
+):
+    service, _ = build_service(tmp_path, enabled=False)
+    sensitive_message = "customer-secret-path-and-payload"
+
+    def fail_result_read(_session_id):
+        raise ProbeServiceError(sensitive_message, 500)
+
+    monkeypatch.setattr(service, "result_text_for", fail_result_read)
+    app = Flask(__name__)
+    app.register_blueprint(create_probe_blueprint(service))
+
+    response = app.test_client().get(
+        f"/api/network-probe/results/{SESSION_ID}.json"
+    )
+
+    assert response.status_code == 500
+    assert "RESULT_READ_FAILED" in response.json["error"]
+    assert sensitive_message not in response.json["error"]
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["X-Content-Type-Options"] == "nosniff"

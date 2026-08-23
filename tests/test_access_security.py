@@ -116,6 +116,21 @@ def test_loopback_keeps_no_auth_compatibility(tmp_path):
     assert response.status_code == 200
 
 
+def test_all_interfaces_binding_does_not_bypass_remote_authentication(tmp_path):
+    config_path = write_config(tmp_path)
+    assert "HOST=0.0.0.0" in config_path.read_text(encoding="utf-8")
+    app = create_app(config_path)
+    app.config.update(TESTING=True)
+    client = app.test_client()
+
+    page_response = client.get("/", environ_base=remote())
+    api_response = client.get("/api/health", environ_base=remote())
+
+    assert page_response.status_code == 302
+    assert page_response.location == "/login"
+    assert api_response.status_code == 401
+
+
 def test_generated_token_file_is_private_and_environment_avoids_file(tmp_path, monkeypatch):
     token, path = load_or_create_access_token(tmp_path)
     assert path is not None
