@@ -23,57 +23,70 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
+          def replace_block(lines, start_marker, end_marker, replacement):
+              start = next((i for i, line in enumerate(lines) if start_marker in line), None)
+              if start is None:
+                  raise SystemExit(f"start marker not found: {start_marker}")
+              end = next(
+                  (i for i in range(start, len(lines)) if end_marker in lines[i]),
+                  None,
+              )
+              if end is None:
+                  raise SystemExit(f"end marker not found: {end_marker}")
+              return lines[:start] + replacement + lines[end + 1:]
+
           app_test = Path("tests/test_app.py")
-          text = app_test.read_text(encoding="utf-8")
-          if "import re\n" not in text:
-              text = text.replace("import os\n", "import os\nimport re\n", 1)
-          old = '''    access_token = (config.app_root / "data/.internal-transfer-access-token").read_text(
-              encoding="ascii"
+          lines = app_test.read_text(encoding="utf-8").splitlines()
+          if "import re" not in lines:
+              insert_at = lines.index("import os") + 1
+              lines.insert(insert_at, "import re")
+          lines = replace_block(
+              lines,
+              'access_token = (config.app_root / "data/.internal-transfer-access-token").read_text(',
+              'auth = {"Authorization": f"Bearer {access_token}"}',
+              [
+                  '    page = client.get(',
+                  '        "/",',
+                  '        environ_overrides={"REMOTE_ADDR": "10.10.10.5"},',
+                  '    )',
+                  '    csrf = re.search(',
+                  '        r\'<meta name="csrf-token" content="([^\"]+)"\',',
+                  '        page.get_data(as_text=True),',
+                  '    )',
+                  '    assert csrf is not None',
+                  '    auth = {"X-CSRF-Token": csrf.group(1)}',
+              ],
           )
-          auth = {"Authorization": f"Bearer {access_token}"}
-          '''
-          new = '''    page = client.get(
-              "/",
-              environ_overrides={"REMOTE_ADDR": "10.10.10.5"},
-          )
-          csrf = re.search(
-              r'<meta name="csrf-token" content="([^\"]+)"',
-              page.get_data(as_text=True),
-          )
-          assert csrf is not None
-          auth = {"X-CSRF-Token": csrf.group(1)}
-          '''
-          if old not in text:
-              raise SystemExit("test_app.py legacy auth block not found")
-          app_test.write_text(text.replace(old, new, 1), encoding="utf-8")
+          app_test.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
           sustained_test = Path("tests/test_network_sustained.py")
-          text = sustained_test.read_text(encoding="utf-8")
-          if "import re\n" not in text:
-              text = text.replace("import logging\n", "import logging\nimport re\n", 1)
-          old = '''def remote_auth(tmp_path: Path) -> dict[str, str]:
-              token = (tmp_path / "data/.internal-transfer-access-token").read_text(
-                  encoding="ascii"
-              )
-              return {"Authorization": f"Bearer {token}"}
-          '''
-          new = '''def remote_auth(client) -> dict[str, str]:
-              page = client.get(
-                  "/",
-                  environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
-              )
-              csrf = re.search(
-                  r'<meta name="csrf-token" content="([^\"]+)"',
-                  page.get_data(as_text=True),
-              )
-              assert csrf is not None
-              return {"X-CSRF-Token": csrf.group(1)}
-          '''
-          if old not in text:
-              raise SystemExit("test_network_sustained.py legacy remote_auth block not found")
-          text = text.replace(old, new, 1)
-          text = text.replace("headers = remote_auth(tmp_path)", "headers = remote_auth(client)")
-          sustained_test.write_text(text, encoding="utf-8")
+          lines = sustained_test.read_text(encoding="utf-8").splitlines()
+          if "import re" not in lines:
+              insert_at = lines.index("import logging") + 1
+              lines.insert(insert_at, "import re")
+          lines = replace_block(
+              lines,
+              "def remote_auth(tmp_path: Path) -> dict[str, str]:",
+              'return {"Authorization": f"Bearer {token}"}',
+              [
+                  'def remote_auth(client) -> dict[str, str]:',
+                  '    page = client.get(',
+                  '        "/",',
+                  '        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},',
+                  '    )',
+                  '    csrf = re.search(',
+                  '        r\'<meta name="csrf-token" content="([^\"]+)"\',',
+                  '        page.get_data(as_text=True),',
+                  '    )',
+                  '    assert csrf is not None',
+                  '    return {"X-CSRF-Token": csrf.group(1)}',
+              ],
+          )
+          lines = [
+              line.replace("headers = remote_auth(tmp_path)", "headers = remote_auth(client)")
+              for line in lines
+          ]
+          sustained_test.write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
 
       - name: Commit migration and remove this workflow
