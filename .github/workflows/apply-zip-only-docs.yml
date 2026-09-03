@@ -1,0 +1,73 @@
+name: Apply ZIP-only release documentation
+
+on:
+  push:
+    branches:
+      - release-zip-only-policy
+    paths:
+      - ".github/workflows/apply-zip-only-docs.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  update-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out policy branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: release-zip-only-policy
+          persist-credentials: true
+
+      - name: Update README release asset instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("README.md")
+          text = path.read_text(encoding="utf-8")
+          old = """[GitHub Releases](https://github.com/sebia1993/internal-network-transfer-diagnostics/releases)에서 다음 자산을 받습니다.
+
+```text
+internal-upload_v0.6.1_windows.zip
+internal-upload_v0.6.1_windows.zip.sha256
+internal-upload_v0.6.1_sbom.cdx.json
+```
+
+1. SHA-256을 확인합니다.
+2. ZIP을 완전히 압축 해제합니다.
+3. `start_internal_upload.cmd`를 실행합니다.
+4. 콘솔에 표시된 주소를 브라우저에서 엽니다.
+5. 다른 내부망 PC에서도 허용된 네트워크 경로로 같은 서버 주소를 바로 엽니다. 별도 웹 로그인 토큰은 없습니다.
+"""
+          new = """[GitHub Releases](https://github.com/sebia1993/internal-network-transfer-diagnostics/releases)에서 Windows ZIP 하나만 받습니다.
+
+```text
+internal-upload_v0.6.1_windows.zip
+```
+
+GitHub Release에는 Windows ZIP만 게시합니다. ZIP의 SHA-256은 릴리스 본문에 표시하며, SBOM과 보안 매니페스트는 ZIP 내부에 포함합니다.
+
+1. 릴리스 본문의 SHA-256과 내려받은 ZIP을 비교합니다.
+2. ZIP을 완전히 압축 해제합니다.
+3. `start_internal_upload.cmd`를 실행합니다.
+4. 콘솔에 표시된 주소를 브라우저에서 엽니다.
+5. 다른 내부망 PC에서도 허용된 네트워크 경로로 같은 서버 주소를 바로 엽니다. 별도 웹 로그인 토큰은 없습니다.
+"""
+          if old not in text:
+              raise SystemExit("README release asset block was not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+
+      - name: Commit documentation update
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Document ZIP-only GitHub releases"
+          git push origin HEAD:release-zip-only-policy
