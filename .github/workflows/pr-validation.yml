@@ -69,11 +69,11 @@ jobs:
       - name: Build Windows release candidate
         shell: pwsh
         run: |
-          .\tools\build_windows_release.ps1 -Version v0.6.0
+          .\tools\build_windows_release.ps1 -Version v0.6.1
           if ($LASTEXITCODE -ne 0) { throw "Windows release build failed with exit code $LASTEXITCODE" }
 
       - name: Verify Windows release candidate
         shell: pwsh
         run: |
-          python tools\verify_release_zip.py --zip dist\internal-upload_v0.6.0_windows.zip --version v0.6.0
+          python tools\verify_release_zip.py --zip dist\internal-upload_v0.6.1_windows.zip --version v0.6.1
           if ($LASTEXITCODE -ne 0) { throw "Windows release verification failed with exit code $LASTEXITCODE" }
