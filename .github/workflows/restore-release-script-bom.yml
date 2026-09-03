@@ -1,0 +1,40 @@
+name: One-time release script BOM restore
+
+on:
+  push:
+    branches:
+      - remove-web-login-token
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: remove-web-login-token
+
+      - name: Restore UTF-8 BOM required by Windows PowerShell compatibility test
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("tools/build_windows_release.ps1")
+          data = path.read_bytes()
+          bom = b"\xef\xbb\xbf"
+          if not data.startswith(bom):
+              path.write_bytes(bom + data)
+          PY
+
+      - name: Commit restore and remove this workflow
+        shell: bash
+        run: |
+          git rm .github/workflows/restore-release-script-bom.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/build_windows_release.ps1
+          git commit -m "Restore Windows release script BOM"
+          git push origin HEAD:remove-web-login-token
