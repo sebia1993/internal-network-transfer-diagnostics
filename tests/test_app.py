@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -647,10 +648,16 @@ def test_delete_requires_allowed_ip(app_client):
     client, config, _ = app_client
     post_file(client, filename="delete.txt", content=b"delete me")
     row = read_upload_log(config)[0]
-    access_token = (config.app_root / "data/.internal-transfer-access-token").read_text(
-        encoding="ascii"
+    page = client.get(
+        "/",
+        environ_overrides={"REMOTE_ADDR": "10.10.10.5"},
     )
-    auth = {"Authorization": f"Bearer {access_token}"}
+    csrf = re.search(
+        r'<meta name="csrf-token" content="([^"]+)"',
+        page.get_data(as_text=True),
+    )
+    assert csrf is not None
+    auth = {"X-CSRF-Token": csrf.group(1)}
 
     denied = client.post(
         f"/delete/{row['upload_id']}",
