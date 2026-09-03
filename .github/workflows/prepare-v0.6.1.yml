@@ -1,0 +1,108 @@
+name: Prepare v0.6.1
+
+on:
+  push:
+    branches:
+      - release-v0.6.1
+    paths:
+      - ".github/workflows/prepare-v0.6.1.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: release-v0.6.1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Update release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          version = "v0.6.1"
+          date = "2026-09-04"
+
+          app_version = Path("app_version.py")
+          text = app_version.read_text(encoding="utf-8")
+          old = 'APP_VERSION = "v0.6.0"'
+          if old not in text:
+              raise SystemExit("app_version.py does not contain v0.6.0")
+          app_version.write_text(text.replace(old, f'APP_VERSION = "{version}"', 1), encoding="utf-8")
+
+          release_workflow = Path(".github/workflows/release.yml")
+          text = release_workflow.read_text(encoding="utf-8")
+          if 'default: "v0.6.0"' not in text:
+              raise SystemExit("release.yml default version marker not found")
+          release_workflow.write_text(text.replace('default: "v0.6.0"', f'default: "{version}"', 1), encoding="utf-8")
+
+          changelog = Path("CHANGELOG.md")
+          text = changelog.read_text(encoding="utf-8")
+          if f"## {version} - {date}" not in text:
+              marker = "## v0.6.0 - 2026-08-24"
+              if marker not in text:
+                  raise SystemExit("CHANGELOG v0.6.0 marker not found")
+              block = f'''## {version} - {date}
+
+- 웹 로그인용 access token과 master Bearer 인증을 제거해 서버 웹 포트에 접근 가능한 내부망 PC에서는 로그인 없이 화면과 GET API를 바로 사용할 수 있도록 변경했습니다.
+- 브라우저 상태 변경 요청의 CSRF 검증, 응답 보안 헤더와 삭제 IP 제한은 유지합니다.
+- TCP 측정의 짧은 수명 1회용 enrollment token, agent 인증, HMAC-SHA256, timestamp·nonce replay 방지는 그대로 유지합니다.
+- `INTERNAL_TRANSFER_ACCESS_TOKEN`, `ACCESS_TOKEN_FILE`, `SESSION_TTL_MINUTES`는 웹 인증에 더 이상 사용하지 않으며 `.internal-transfer-access-token` 파일도 새로 생성하거나 읽지 않습니다.
+- 기본 설정, 보안 모델, UI 안내, 회귀 테스트, Windows 릴리스 빌드 안내, 보안 산출물과 ZIP verifier를 새 접근 정책에 맞춰 갱신했습니다.
+- Windows PR Validation에서 전체 회귀·fault suite, server/client self-check, Windows release candidate 빌드와 ZIP 검증을 통과했습니다.
+- 웹 인증이 없으므로 인터넷 또는 불특정 사용자 네트워크에 직접 노출하지 않고 Windows 방화벽, VLAN/ACL 또는 VPN으로 웹 포트 접근 범위를 제한해야 합니다.
+
+'''
+              changelog.write_text(text.replace(marker, block + marker, 1), encoding="utf-8")
+
+          release_notes = Path("RELEASE_NOTES.md")
+          text = release_notes.read_text(encoding="utf-8")
+          text = text.replace("현재 앱 버전: `v0.6.0`", f"현재 앱 버전: `{version}`", 1)
+          if f"## {version} - {date}" not in text:
+              marker = "## v0.6.0 - 2026-08-24"
+              if marker not in text:
+                  raise SystemExit("RELEASE_NOTES v0.6.0 marker not found")
+              block = f'''## {version} - {date}
+
+웹 로그인 access token을 제거하고, TCP 클라이언트 등록·HMAC 보안은 유지하는 패치 릴리스입니다. 서버 웹 포트에 도달 가능한 내부망 PC에서는 로그인 화면 없이 바로 접속합니다.
+
+게시 전 게이트:
+
+- 웹 무로그인 원격 접근, CSRF 실패/성공, TCP enrollment single-use/expiry 회귀 검증
+- Python compileall, JavaScript 구문 검사, tracked secret scan, fault suite와 `pip check`
+- clean Windows onedir 서버/클라이언트 빌드와 self-check
+- Release ZIP verifier, SHA256, CycloneDX SBOM 및 보안 산출물 검증
+- annotated `{version}` tag와 배포 소스 commit 일치 확인
+
+웹 인증이 없으므로 신뢰할 수 있는 사내망/VPN에서만 사용하고 Windows 방화벽·VLAN/ACL로 웹 포트 접근 범위를 제한합니다. 내장 HTTP/TCP는 암호화하지 않으며 Windows binary는 코드 서명되지 않았습니다.
+
+'''
+              text = text.replace(marker, block + marker, 1)
+          release_notes.write_text(text, encoding="utf-8")
+
+          readme = Path("README.md")
+          text = readme.read_text(encoding="utf-8")
+          text = text.replace("internal-upload_v0.6.0_windows.zip.sha256", "internal-upload_v0.6.1_windows.zip.sha256")
+          text = text.replace("internal-upload_v0.6.0_windows.zip", "internal-upload_v0.6.1_windows.zip")
+          text = text.replace("internal-upload_v0.6.0_sbom.cdx.json", "internal-upload_v0.6.1_sbom.cdx.json")
+          readme.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Commit release preparation and remove this workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/prepare-v0.6.1.yml
+          git add app_version.py .github/workflows/release.yml CHANGELOG.md RELEASE_NOTES.md README.md
+          git commit -m "Prepare v0.6.1 release"
+          git push origin HEAD:release-v0.6.1
