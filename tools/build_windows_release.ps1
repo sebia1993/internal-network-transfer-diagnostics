@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^v\d+\.\d+\.\d+(?:-rc\.\d+)?$')]
     [string]$Version
