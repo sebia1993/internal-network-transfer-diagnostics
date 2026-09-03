@@ -184,9 +184,9 @@ TCP 전송 성능 측정:
 5. 서버 IP 또는 웹 포트가 바뀌면 클라이언트 ZIP을 다시 받습니다.
 
 보안 정보:
-- 루프백이 아닌 웹 접근은 토큰 로그인 또는 Bearer 인증이 필요합니다.
-- 브라우저의 상태 변경 요청은 CSRF 토큰을 검증하고 TCP 제어 프레임은 HMAC과 nonce로 재전송을 차단합니다.
-- 최초 실행 시 data/.internal-transfer-access-token이 생성되며 토큰 값은 로그나 명령행에 표시하지 않습니다.
+- 웹 로그인 토큰은 사용하지 않습니다. 서버 웹 포트에 도달 가능한 내부망 사용자는 화면을 바로 열 수 있습니다.
+- 브라우저의 상태 변경 요청은 CSRF 토큰을 검증하고 TCP 클라이언트 등록은 짧은 수명의 일회용 enrollment token을 유지합니다.
+- TCP 제어 프레임은 HMAC과 nonce로 재전송을 차단합니다. 웹 접근 범위는 Windows 방화벽, VLAN/ACL 또는 VPN으로 제한하세요.
 - 서버와 클라이언트는 기능이 분리된 별도 실행 파일입니다.
 - 서버 시작 과정에서 PowerShell을 실행하지 않습니다.
 - 실행파일, 스크립트, 매크로 문서와 디스크 이미지는 업로드할 수 없습니다.
@@ -196,22 +196,12 @@ TCP 전송 성능 측정:
 
     $PackagedServerExe = Join-Path $PackageRoot "InternalUploadServer.exe"
     $PackagedClientExe = Join-Path $ClientTemplate "NetworkProbeClient.exe"
-    $SmokeTokenBytes = New-Object byte[] 48
-    $RandomNumberGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $RandomNumberGenerator.GetBytes($SmokeTokenBytes)
-    $RandomNumberGenerator.Dispose()
-    $env:INTERNAL_TRANSFER_ACCESS_TOKEN = "build-smoke-only-" + [Convert]::ToBase64String($SmokeTokenBytes)
-    try {
-        & $PackagedServerExe --smoke-check
-        if ($LASTEXITCODE -ne 0) { throw "Server smoke check failed" }
-        & $PackagedServerExe --probe-self-check
-        if ($LASTEXITCODE -ne 0) { throw "Server probe self-check failed" }
-        & $PackagedClientExe --self-check
-        if ($LASTEXITCODE -ne 0) { throw "Client self-check failed" }
-    }
-    finally {
-        Remove-Item Env:INTERNAL_TRANSFER_ACCESS_TOKEN -ErrorAction SilentlyContinue
-    }
+    & $PackagedServerExe --smoke-check
+    if ($LASTEXITCODE -ne 0) { throw "Server smoke check failed" }
+    & $PackagedServerExe --probe-self-check
+    if ($LASTEXITCODE -ne 0) { throw "Server probe self-check failed" }
+    & $PackagedClientExe --self-check
+    if ($LASTEXITCODE -ne 0) { throw "Client self-check failed" }
 
     $RuntimeLock = Join-Path $PackageRoot "data/.internal-upload.instance.lock"
     if (Test-Path $RuntimeLock) { Remove-Item $RuntimeLock -Force }
@@ -241,10 +231,10 @@ TCP 전송 성능 측정:
 
 ## 주요 변경
 
-- 루프백이 아닌 웹 요청에 토큰 로그인 또는 Bearer 인증을 의무화하고 브라우저 상태 변경 요청에 CSRF 검증 적용
+- 웹 로그인 access token과 master Bearer 인증을 제거하고 내부망에서 서버 주소를 바로 열 수 있도록 변경
+- 브라우저 상태 변경 요청의 CSRF 검증과 응답 보안 헤더는 유지
 - TCP 제어 프레임을 프로토콜 ``v3`` HMAC-SHA256으로 인증하고 timestamp·nonce 재전송 방지 적용
-- Windows 클라이언트 등록을 짧은 수명의 일회용 enrollment token으로 제한
-- 접근 토큰은 환경 변수 또는 소유자 전용 파일에서만 읽고 토큰 값을 로그·URL·명령행에 노출하지 않음
+- Windows 클라이언트 등록은 짧은 수명의 일회용 enrollment token을 계속 사용
 - PR·main push 검증의 모든 native 명령 실패를 즉시 전파해 뒤 명령이 실패 코드를 덮는 false-green 제거
 - Windows soak Python 출력을 UTF-8로 고정하고 Step Summary는 bounded Markdown만 게시하며 원시 JSON은 artifact로 보존
 - 기존 트랜잭션 복구, bounded server, 결과 검증과 CSV·JSON·Excel 호환성 유지

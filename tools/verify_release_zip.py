@@ -187,12 +187,6 @@ def validate_default_config(zip_file: ZipFile) -> list[str]:
             return ["config.ini must enable TCP probe by default"]
         if not 1 <= parser.getint("network_probe", "PORT", fallback=0) <= 65535:
             return ["config.ini has an invalid TCP probe port"]
-        if parser.get("security", "ACCESS_TOKEN_FILE", fallback="") != (
-            "data/.internal-transfer-access-token"
-        ):
-            return ["config.ini has an invalid access token file setting"]
-        if not 5 <= parser.getint("security", "SESSION_TTL_MINUTES", fallback=0) <= 1440:
-            return ["config.ini has an invalid session TTL"]
         if not 30 <= parser.getint(
             "security",
             "ENROLLMENT_TOKEN_TTL_SECONDS",

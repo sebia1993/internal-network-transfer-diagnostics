@@ -32,7 +32,7 @@ def test_windows_release_build_requires_clean_worktree_and_onedir_bundles():
     assert "InternalUploadServer.exe" in script
     assert "NetworkProbeClient.exe" in script
     assert "powershell.exe" not in script.casefold()
-    assert "INTERNAL_TRANSFER_ACCESS_TOKEN" in script
+    assert "INTERNAL_TRANSFER_ACCESS_TOKEN" not in script
     assert "_sbom.cdx.json" in script
     assert "HMAC-SHA256" in script
     assert "false-green" in script

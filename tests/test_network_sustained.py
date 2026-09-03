@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import re
 import time
 from io import BytesIO
 from pathlib import Path
@@ -933,11 +934,17 @@ def sustained_client(tmp_path):
     return app.test_client(), tmp_path
 
 
-def remote_auth(tmp_path: Path) -> dict[str, str]:
-    token = (tmp_path / "data/.internal-transfer-access-token").read_text(
-        encoding="ascii"
+def remote_auth(client) -> dict[str, str]:
+    page = client.get(
+        "/",
+        environ_overrides={"REMOTE_ADDR": "10.0.0.10"},
     )
-    return {"Authorization": f"Bearer {token}"}
+    csrf = re.search(
+        r'<meta name="csrf-token" content="([^"]+)"',
+        page.get_data(as_text=True),
+    )
+    assert csrf is not None
+    return {"X-CSRF-Token": csrf.group(1)}
 
 
 def test_sustained_routes_validate_and_cancel(sustained_client):
@@ -994,7 +1001,7 @@ def test_sustained_routes_validate_and_cancel(sustained_client):
 
 def test_sustained_result_download_is_limited_to_origin_ip(sustained_client):
     client, tmp_path = sustained_client
-    headers = remote_auth(tmp_path)
+    headers = remote_auth(client)
     started = client.post(
         "/network-check/sustained/sessions",
         json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
@@ -1050,7 +1057,7 @@ def test_sustained_json_download_reads_authorized_result_once(
     monkeypatch,
 ):
     client, tmp_path = sustained_client
-    headers = remote_auth(tmp_path)
+    headers = remote_auth(client)
     started = client.post(
         "/network-check/sustained/sessions",
         json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
@@ -1100,7 +1107,7 @@ def test_sustained_json_download_returns_safe_error_when_result_read_fails(
     monkeypatch,
 ):
     client, tmp_path = sustained_client
-    headers = remote_auth(tmp_path)
+    headers = remote_auth(client)
     started = client.post(
         "/network-check/sustained/sessions",
         json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
@@ -1143,7 +1150,7 @@ def test_sustained_json_download_returns_safe_error_for_invalid_utf8(
     sustained_client,
 ):
     client, tmp_path = sustained_client
-    headers = remote_auth(tmp_path)
+    headers = remote_auth(client)
     started = client.post(
         "/network-check/sustained/sessions",
         json={"direction": "upload", "duration_seconds": 10, "stream_count": 1},
