@@ -22,6 +22,15 @@
     return originalFetch(input, {...init, headers});
   };
 
+  const sessionResetForm = document.querySelector(".logout-form");
+  if (sessionResetForm) {
+    const button = sessionResetForm.querySelector("button");
+    if (button) {
+      button.textContent = "세션 초기화";
+      button.title = "웹 로그인은 사용하지 않습니다. 브라우저 CSRF 세션만 초기화합니다.";
+    }
+  }
+
   document.querySelectorAll("[data-select-on-click]").forEach((element) => {
     element.addEventListener("click", () => element.select());
   });
