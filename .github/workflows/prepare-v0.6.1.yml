@@ -38,12 +38,6 @@ jobs:
               raise SystemExit("app_version.py does not contain v0.6.0")
           app_version.write_text(text.replace(old, f'APP_VERSION = "{version}"', 1), encoding="utf-8")
 
-          release_workflow = Path(".github/workflows/release.yml")
-          text = release_workflow.read_text(encoding="utf-8")
-          if 'default: "v0.6.0"' not in text:
-              raise SystemExit("release.yml default version marker not found")
-          release_workflow.write_text(text.replace('default: "v0.6.0"', f'default: "{version}"', 1), encoding="utf-8")
-
           changelog = Path("CHANGELOG.md")
           text = changelog.read_text(encoding="utf-8")
           if f"## {version} - {date}" not in text:
@@ -100,13 +94,12 @@ jobs:
           readme.write_text(text, encoding="utf-8")
           PY
 
-      - name: Commit release preparation and remove this workflow
+      - name: Commit release preparation
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm .github/workflows/prepare-v0.6.1.yml
-          git add app_version.py .github/workflows/release.yml CHANGELOG.md RELEASE_NOTES.md README.md
+          git add app_version.py CHANGELOG.md RELEASE_NOTES.md README.md
           git commit -m "Prepare v0.6.1 release"
           git push origin HEAD:release-v0.6.1
