@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from app_version import APP_VERSION
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,7 +32,7 @@ def test_pr_validation_cannot_mask_native_failures_and_runs_on_main():
             key=lambda value: float("inf") if value < 0 else value,
         )
         assert next_native < 0 or next_guard < next_native
-    assert "v0.6.0" in workflow
+    assert APP_VERSION in workflow
 
 
 def test_soak_keeps_step_summary_bounded_and_raw_json_in_artifact():
