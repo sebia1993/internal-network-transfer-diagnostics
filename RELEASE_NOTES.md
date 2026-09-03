@@ -1,8 +1,22 @@
 # Release Notes 운영 규칙
 
-현재 앱 버전: `v0.6.0`
+현재 앱 버전: `v0.6.1`
 
 이 파일은 저장소에 커밋하는 릴리즈 준비 점검 문서입니다. 현재 GitHub Actions가 Windows 실행 ZIP을 만들고 GitHub Release에 업로드합니다. Release 본문은 이 파일과 `CHANGELOG.md` 기준으로 작성합니다.
+
+## v0.6.1 - 2026-09-04
+
+웹 로그인 access token을 제거하고, TCP 클라이언트 등록·HMAC 보안은 유지하는 패치 릴리스입니다. 서버 웹 포트에 도달 가능한 내부망 PC에서는 로그인 화면 없이 바로 접속합니다.
+
+게시 전 게이트:
+
+- 웹 무로그인 원격 접근, CSRF 실패/성공, TCP enrollment single-use/expiry 회귀 검증
+- Python compileall, JavaScript 구문 검사, tracked secret scan, fault suite와 `pip check`
+- clean Windows onedir 서버/클라이언트 빌드와 self-check
+- Release ZIP verifier, SHA256, CycloneDX SBOM 및 보안 산출물 검증
+- annotated `v0.6.1` tag와 배포 소스 commit 일치 확인
+
+웹 인증이 없으므로 신뢰할 수 있는 사내망/VPN에서만 사용하고 Windows 방화벽·VLAN/ACL로 웹 포트 접근 범위를 제한합니다. 내장 HTTP/TCP는 암호화하지 않으며 Windows binary는 코드 서명되지 않았습니다.
 
 ## v0.6.0 - 2026-08-24
 

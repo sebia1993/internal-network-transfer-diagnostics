@@ -104,9 +104,9 @@ flowchart LR
 [GitHub Releases](https://github.com/sebia1993/internal-network-transfer-diagnostics/releases)에서 다음 자산을 받습니다.
 
 ```text
-internal-upload_v0.6.0_windows.zip
-internal-upload_v0.6.0_windows.zip.sha256
-internal-upload_v0.6.0_sbom.cdx.json
+internal-upload_v0.6.1_windows.zip
+internal-upload_v0.6.1_windows.zip.sha256
+internal-upload_v0.6.1_sbom.cdx.json
 ```
 
 1. SHA-256을 확인합니다.

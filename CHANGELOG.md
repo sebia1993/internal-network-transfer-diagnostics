@@ -2,6 +2,16 @@
 
 이 문서는 저장소에 반영된 주요 변경을 사람이 확인하기 위한 기록입니다. GitHub에 push하거나 Release를 준비하기 전에 `README.md`, `RELEASE_NOTES.md`, `CHANGELOG.md`를 함께 점검합니다.
 
+## v0.6.1 - 2026-09-04
+
+- 웹 로그인용 access token과 master Bearer 인증을 제거해 서버 웹 포트에 접근 가능한 내부망 PC에서는 로그인 없이 화면과 GET API를 바로 사용할 수 있도록 변경했습니다.
+- 브라우저 상태 변경 요청의 CSRF 검증, 응답 보안 헤더와 삭제 IP 제한은 유지합니다.
+- TCP 측정의 짧은 수명 1회용 enrollment token, agent 인증, HMAC-SHA256, timestamp·nonce replay 방지는 그대로 유지합니다.
+- `INTERNAL_TRANSFER_ACCESS_TOKEN`, `ACCESS_TOKEN_FILE`, `SESSION_TTL_MINUTES`는 웹 인증에 더 이상 사용하지 않으며 `.internal-transfer-access-token` 파일도 새로 생성하거나 읽지 않습니다.
+- 기본 설정, 보안 모델, UI 안내, 회귀 테스트, Windows 릴리스 빌드 안내, 보안 산출물과 ZIP verifier를 새 접근 정책에 맞춰 갱신했습니다.
+- Windows PR Validation에서 전체 회귀·fault suite, server/client self-check, Windows release candidate 빌드와 ZIP 검증을 통과했습니다.
+- 웹 인증이 없으므로 인터넷 또는 불특정 사용자 네트워크에 직접 노출하지 않고 Windows 방화벽, VLAN/ACL 또는 VPN으로 웹 포트 접근 범위를 제한해야 합니다.
+
 ## v0.6.0 - 2026-08-24
 
 - 비루프백 HTTP 요청에 token login 또는 master Bearer 인증을 의무화하고 cookie 상태 변경 요청에 CSRF 검증을 추가했습니다.
