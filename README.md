@@ -19,7 +19,7 @@
 | 어떤 문제를 해결하는가? | 내부망 장애 분석 파일 전달과 전송 상태 확인을 한 화면에 묶었습니다. |
 | 네트워크 전문성이 어디에 드러나는가? | HTTP와 별도 TCP 경로를 나눠 측정하고, 평균값뿐 아니라 1초 표본·변동·부분 실패를 보존합니다. |
 | 운영 안정성은 어떻게 다루는가? | worker 상한, single-flight 측정, 디스크 예약, graceful shutdown, transaction 기반 재시작 복구를 적용했습니다. |
-| 보안 경계는 무엇인가? | 비루프백 HTTP 인증·CSRF, TCP HMAC·재전송 방지, 저장 경로 제한, 위험 파일 차단을 적용했습니다. |
+| 보안 경계는 무엇인가? | 웹 요청에는 CSRF·보안 헤더를 적용하고, TCP에는 1회용 등록 토큰·HMAC·재전송 방지를 적용하며 저장 경로 제한과 위험 파일 차단을 유지합니다. 웹 로그인 인증은 사용하지 않으므로 신뢰할 수 있는 내부망 경계가 전제입니다. |
 | 품질을 어떻게 증명하는가? | Windows CI, 회귀·장애 주입 테스트, 45분 합성 soak, CodeQL, secret scan, ZIP/SHA/SBOM 검증을 자동화했습니다. |
 
 기술 스택: Python, Flask, TCP sockets, JavaScript, pytest, PowerShell, GitHub Actions, PyInstaller, CSV/JSON/Excel, CycloneDX
@@ -27,11 +27,10 @@
 ## 사용 흐름
 
 1. 운영자가 Windows 서버를 실행합니다.
-2. 같은 PC에서는 인증 없이 루프백 화면을 열 수 있습니다.
-3. 다른 PC에서는 서버가 만든 접근 토큰으로 로그인합니다.
-4. 진단 파일을 업로드하거나 HTTP 전송 측정을 실행합니다.
-5. TCP 비교가 필요하면 화면에서 일회용 등록 토큰이 든 Windows 클라이언트 ZIP을 받습니다.
-6. 결과를 화면, JSON, CSV 또는 Excel로 확인합니다.
+2. 같은 PC 또는 접근 가능한 내부망 PC에서 서버 주소를 바로 엽니다. 웹 로그인 토큰은 필요하지 않습니다.
+3. 진단 파일을 업로드하거나 HTTP 전송 측정을 실행합니다.
+4. TCP 비교가 필요하면 화면에서 일회용 등록 토큰이 든 Windows 클라이언트 ZIP을 받습니다.
+5. 결과를 화면, JSON, CSV 또는 Excel로 확인합니다.
 
 화면별 역할과 합성 시나리오는 [UI 안내](docs/UI_WALKTHROUGH_KO.md)에 정리했습니다.
 
@@ -39,7 +38,7 @@
 
 ```mermaid
 flowchart LR
-    O["운영자 브라우저"] -->|"로그인 세션 + CSRF / Bearer"| W["Bounded Flask 서버"]
+    O["운영자 브라우저"] -->|"직접 접근 + CSRF"| W["Bounded Flask 서버"]
     A["Windows TCP 클라이언트"] -->|"일회용 등록 + Agent Bearer"| W
     A -->|"HMAC-SHA256 + timestamp + nonce"| T["TCP 측정 서버"]
     W --> U["파일 전송"]
@@ -86,20 +85,17 @@ flowchart LR
 
 복구할 수 없는 모호한 상태는 정상으로 추정하지 않고 새 작업을 차단합니다.
 
-## 인증과 비밀 관리
+## 접근 보안과 비밀 관리
 
-기본 설정 `HOST=0.0.0.0`에서는 루프백이 아닌 요청에 인증이 필요합니다.
+웹 로그인용 access token과 master Bearer 인증은 사용하지 않습니다. `HOST=0.0.0.0`으로 실행하면 해당 포트에 네트워크로 도달할 수 있는 사용자가 웹 화면을 바로 열 수 있습니다.
 
-- 브라우저: 접근 토큰 로그인 + cookie session + CSRF
-- API 자동화: master Bearer token, cookie를 사용하지 않으므로 CSRF 면제
-- TCP 등록: 짧은 수명의 1회용 enrollment token
+- 브라우저: 별도 로그인 없음, unsafe 요청에는 CSRF 검증 적용
+- TCP 등록: 짧은 수명의 1회용 enrollment token 유지
 - TCP 제어: agent/session별 HMAC-SHA256, 60초 시간 범위와 nonce 재사용 차단
-- 접근 토큰: `INTERNAL_TRANSFER_ACCESS_TOKEN` 환경 변수 또는 소유자 전용 파일
-- 금지: 토큰 값을 URL, CLI 인수, 로그, Git 저장 파일에 기록
+- 웹 응답: `Cache-Control`, CSP, `X-Frame-Options`, `X-Content-Type-Options` 등 보안 헤더 적용
+- 기존 `INTERNAL_TRANSFER_ACCESS_TOKEN` 환경 변수와 `data/.internal-transfer-access-token` 파일은 더 이상 생성·읽기·검증에 사용하지 않음
 
-최초 실행 시 기본 토큰 파일은 `data/.internal-transfer-access-token`에 만들어집니다. POSIX에서는 `0600`이 아니면 시작을 거부합니다. Windows에서는 파일을 서버 계정만 읽을 수 있는 위치와 ACL로 보호해야 합니다.
-
-중요: 내장 HTTP/TCP는 암호화를 제공하지 않습니다. 인증은 무단 사용을 줄이지만 도청을 막지 못합니다. 신뢰할 수 있는 내부망·VPN에서 사용하고, 신뢰 경계를 넘으면 TLS 역방향 프록시를 적용하세요.
+중요: 웹 인증이 없으므로 이 프로그램을 인터넷이나 불특정 사용자에게 노출하면 안 됩니다. 신뢰할 수 있는 사내망/VPN에서 사용하고 Windows 방화벽·네트워크 ACL 등으로 접근 가능한 대역을 제한하세요. 내장 HTTP/TCP는 데이터 암호화를 제공하지 않으므로 신뢰 경계를 넘으면 TLS 역방향 프록시를 적용해야 합니다.
 
 자세한 위협·제한·운영 조치는 [보안 모델](docs/SECURITY_MODEL.md)에 있습니다.
 
@@ -117,7 +113,7 @@ internal-upload_v0.6.0_sbom.cdx.json
 2. ZIP을 완전히 압축 해제합니다.
 3. `start_internal_upload.cmd`를 실행합니다.
 4. 콘솔에 표시된 주소를 브라우저에서 엽니다.
-5. 다른 PC에서는 서버의 접근 토큰 파일 값을 로그인 화면에 입력합니다.
+5. 다른 내부망 PC에서도 허용된 네트워크 경로로 같은 서버 주소를 바로 엽니다. 별도 웹 로그인 토큰은 없습니다.
 
 프로그램은 Windows 방화벽을 자동 변경하거나 권한 상승을 요청하지 않습니다.
 
@@ -138,18 +134,16 @@ ENABLED=true
 PORT=5201
 
 [security]
-ACCESS_TOKEN_FILE=data/.internal-transfer-access-token
-SESSION_TTL_MINUTES=480
 ENROLLMENT_TOKEN_TTL_SECONDS=300
 ```
 
-잘못된 명시 설정은 조용히 기본값으로 대체하지 않고 허용 범위를 안내한 뒤 시작을 중단합니다. `CONFIG_VERSION=2`에서 `3`으로 올라갈 때 사용자가 끈 TCP 측정 설정은 유지합니다.
+기존 설정 파일에 `ACCESS_TOKEN_FILE` 또는 `SESSION_TTL_MINUTES`가 남아 있어도 호환성을 위해 읽기는 가능하지만 웹 인증에는 사용되지 않습니다. 잘못된 명시 설정은 조용히 기본값으로 대체하지 않고 허용 범위를 안내한 뒤 시작을 중단합니다. `CONFIG_VERSION=2`에서 `3`으로 올라갈 때 사용자가 끈 TCP 측정 설정은 유지합니다.
 
 ## 검증
 
 | 검증 | 실행 환경 | 확인하는 것 | 확인하지 못하는 것 |
 |---|---|---|---|
-| 회귀·장애 주입 | Windows CI와 로컬 개발 환경 | 라우트, 복구, 인증 실패, HMAC·replay, 파일/결과 무결성 | 실제 조직의 장비·보안 제품 호환성 |
+| 회귀·장애 주입 | Windows CI와 로컬 개발 환경 | 라우트, 웹 무로그인 접근, CSRF, TCP 등록/HMAC·replay, 복구, 파일/결과 무결성 | 실제 조직의 장비·보안 제품 호환성 |
 | Windows 패키지 | GitHub-hosted Windows runner | EXE self-check, ZIP 구조, SHA, SBOM, security manifest | 코드 서명된 publisher 신원 |
 | 45분 soak | GitHub-hosted Windows runner의 합성 파일/루프백 TCP | 업로드·TCP 자체 점검·재시작과 후처리, 자원 추세 | 현장 회선 속도, 장기 무중단 운영 전체 |
 | CodeQL default setup | GitHub Actions | Python·JavaScript의 알려진 코드 보안 패턴 | 모든 취약점·동적 운영 공격 |
@@ -184,6 +178,7 @@ python tools/render_windows_soak_summary.py --summary windows-soak-summary.json 
 ## 알려진 한계
 
 - 인터넷 공개형·다중 사용자 파일 공유 서비스가 아닙니다.
+- 웹 로그인 인증이 없으므로 네트워크 접근 제어가 필수입니다.
 - HTTP/TCP 데이터 기밀성을 제공하지 않습니다.
 - Windows EXE는 코드 서명되지 않았습니다.
 - 업로드 전체 크기의 고정 상한과 압축파일 내부 검사는 없습니다.
