@@ -101,15 +101,15 @@ flowchart LR
 
 ## Windows 실행
 
-[GitHub Releases](https://github.com/sebia1993/internal-network-transfer-diagnostics/releases)에서 다음 자산을 받습니다.
+[GitHub Releases](https://github.com/sebia1993/internal-network-transfer-diagnostics/releases)에서 Windows ZIP 하나만 받습니다.
 
 ```text
 internal-upload_v0.6.1_windows.zip
-internal-upload_v0.6.1_windows.zip.sha256
-internal-upload_v0.6.1_sbom.cdx.json
 ```
 
-1. SHA-256을 확인합니다.
+GitHub Release에는 Windows ZIP만 게시합니다. ZIP의 SHA-256은 릴리스 본문에 표시하며, SBOM과 보안 매니페스트는 ZIP 내부에 포함합니다.
+
+1. 릴리스 본문의 SHA-256과 내려받은 ZIP을 비교합니다.
 2. ZIP을 완전히 압축 해제합니다.
 3. `start_internal_upload.cmd`를 실행합니다.
 4. 콘솔에 표시된 주소를 브라우저에서 엽니다.

@@ -109,7 +109,7 @@ jobs:
           .\tools\build_windows_release.ps1 -Version $env:RELEASE_VERSION
           if ($LASTEXITCODE -ne 0) { throw "Windows release build failed with exit code $LASTEXITCODE" }
 
-      - name: Upload ZIP to GitHub Release
+      - name: Publish only the Windows ZIP asset
         shell: pwsh
         run: |
           $zip = "dist/internal-upload_${env:RELEASE_VERSION}_windows.zip"
@@ -125,10 +125,10 @@ jobs:
             throw "Missing release notes: $notes"
           }
           if (-not (Test-Path $sha)) {
-            throw "Missing SHA256 file: $sha"
+            throw "Missing locally verified SHA256 file: $sha"
           }
           if (-not (Test-Path $sbom)) {
-            throw "Missing SBOM file: $sbom"
+            throw "Missing locally verified SBOM file: $sbom"
           }
 
           $isPrerelease = $env:RELEASE_VERSION -match '-rc\.\d+$'
@@ -140,10 +140,22 @@ jobs:
           }
 
           if ($isPrerelease) {
-            gh release create $env:RELEASE_VERSION $zip $sha $sbom --repo $env:GITHUB_REPOSITORY --verify-tag --title $title --notes-file $notes --prerelease
+            gh release create $env:RELEASE_VERSION $zip --repo $env:GITHUB_REPOSITORY --verify-tag --title $title --notes-file $notes --prerelease
             if ($LASTEXITCODE -ne 0) { throw "Prerelease publication failed with exit code $LASTEXITCODE" }
           }
           else {
-            gh release create $env:RELEASE_VERSION $zip $sha $sbom --repo $env:GITHUB_REPOSITORY --verify-tag --title $title --notes-file $notes
+            gh release create $env:RELEASE_VERSION $zip --repo $env:GITHUB_REPOSITORY --verify-tag --title $title --notes-file $notes
             if ($LASTEXITCODE -ne 0) { throw "Release publication failed with exit code $LASTEXITCODE" }
+          }
+
+          $expectedAsset = [System.IO.Path]::GetFileName($zip)
+          $assetNames = @(
+            gh release view $env:RELEASE_VERSION --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
+          )
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to verify release assets"
+          }
+          $assets = @($assetNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($assets.Count -ne 1 -or $assets[0] -ne $expectedAsset) {
+            throw "Release asset policy violation: expected only $expectedAsset, found $($assets -join ', ')"
           }
